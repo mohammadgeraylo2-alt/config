@@ -1,6 +1,5 @@
 rubka
 requests
 yt-dlp
-shazamio
+shazamio>=0.6.0
 imageio-ffmpeg
-Pillow
