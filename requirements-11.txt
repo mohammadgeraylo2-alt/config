@@ -1,0 +1,5 @@
+rubka
+requests
+yt-dlp
+shazamio
+imageio-ffmpeg
