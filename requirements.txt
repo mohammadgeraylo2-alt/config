@@ -5,3 +5,4 @@ shazamio>=0.6.0
 imageio-ffmpeg
 Pillow>=10.0.0
 audioop-lts
+rubpy
