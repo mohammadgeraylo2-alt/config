@@ -57,81 +57,6 @@ def _rubino_login_worker(phone: str, code_queue: "queue.Queue", result_queue: "q
     import builtins
     original_input = builtins.input
 
-    def _rubino_login_worker(phone: str, code_queue: "queue.Queue", result_queue: "queue.Queue"):
-    import builtins
-    original_input = builtins.input
-
-    def fake_input(prompt=""):
-        logger.info(f"🔑 rubino login prompt: {prompt}")
-        p = (prompt or "").lower()
-        if "phone" in p or "شماره" in p:
-            return phone
-        if "correct" in p or "[y or n]" in p or "y/n" in p:
-            return "y"
-        return code_queue.get()
-
-    builtins.input = fake_input
-    try:
-        from rubpy import Client
-# -*- coding: utf-8 -*-
-"""
-ربات دانلودر اینستاگرام/پینترست + جستجوی آهنگ برای روبیکا
-ساخته‌شده با کتابخانه rubka
-نسخه ۱: پست/ریل اینستاگرام، پین پینترست، جستجو و دانلود آهنگ
-"""
-
-import os
-import re
-import glob
-import time
-import logging
-import inspect
-import subprocess
-import asyncio
-import sqlite3
-import threading
-from datetime import datetime, timedelta
-
-import requests
-import yt_dlp
-
-from rubka import Robot
-from rubka.context import Message
-from rubka.button import InlineBuilder
-
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ─── تنظیم مسیر ffmpeg (لازم برای تشخیص آهنگ از ویدیو) ──────────────────────
-try:
-    import imageio_ffmpeg
-    _FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-except Exception as _e:
-    import shutil
-    _FFMPEG_EXE = shutil.which("ffmpeg") or "ffmpeg"
-    logger.warning(f"imageio_ffmpeg لود نشد، از ffmpeg سیستم استفاده میشه: {_e}")
-
-# ─── تنظیمات ────────────────────────────────────────────────────────────────
-TOKEN = os.environ["BOT_TOKEN"]                       # توکن ربات روبیکا
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")     # برای Pro Social API (اختیاری)
-INSTAGRAM_COOKIES = os.environ.get("INSTAGRAM_COOKIES", "")  # کوکی اینستاگرام برای yt-dlp (اختیاری)
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")   # chat_id عددی/GUID خودت توی روبیکا (برای دسترسی به پنل ادمین)
-
-CAPTION = "🎵 ربات دانلودر و موزیک‌یاب"
-
-bot = Robot(token=TOKEN)
-
-# ─── لاگین اکانت جدا برای Rubino (فقط ادمین) ────────────────────────────────
-import queue
-import base64
-
-_rubino_login_state = {}
-
-
-def _rubino_login_worker(phone: str, code_queue: "queue.Queue", result_queue: "queue.Queue"):
-    import builtins
-    original_input = builtins.input
-
     def fake_input(prompt=""):
         logger.info(f"🔑 rubino login prompt: {prompt}")
         p = (prompt or "").lower()
@@ -168,24 +93,7 @@ async def _watch_rubino_login(chat_id, result_queue):
 
 
 @bot.on_message(commands=["rubino_login"])
-async def rubino_login_cmd(bot: Robot, message: Message):D or message.sender_id != ADMIN_CHAT_ID:
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await _rx(message.reply("فرمت: /rubino_login 989123456789"))
-        return
-    phone = parts[1]
-    code_queue = queue.Queue()
-    result_queue = queue.Queue()
-    _rubino_login_state["code_queue"] = code_queue
-    t = threading.Thread(target=_rubino_login_worker, args=(phone, code_queue, result_queue), daemon=True)
-    t.start()
-    await _rx(message.reply("📲 منتظر کد تایید هستم. وقتی رسید بفرست:\n/rubino_code 12345"))
-    _spawn(_watch_rubino_login(message.chat_id, result_queue))
-
-
-@bot.on_message(commands=["rubino_code"])
-async def rubino_code_cmd(bot: Robot, message: Message):
+async def rubino_login_cmd(bot: Robot, message: Message):
     if not ADMIN_CHAT_ID or message.sender_id != ADMIN_CHAT_ID:
         return
     parts = (message.text or "").split()
