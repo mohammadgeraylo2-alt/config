@@ -28,12 +28,15 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 logger = logging.getLogger(__name__)
 
 try:
+    import inspect
     from rubpy import Client as RubpyClient
-    login_methods = [m for m in dir(RubpyClient) if not m.startswith('_') and
-                      any(k in m.lower() for k in ('code', 'login', 'sign', 'auth', 'start', 'register'))]
-    logger.info(f"🔍 متدهای لاگین rubpy.Client: {login_methods}")
+    for m in ["send_code", "sign_in", "register_device", "start"]:
+        try:
+            logger.info(f"🔍 امضای {m}: {inspect.signature(getattr(RubpyClient, m))}")
+        except Exception as ie:
+            logger.info(f"🔍 امضای {m}: خطا ({ie})")
 except Exception as e:
-    logger.warning(f"⚠️ بررسی rubpy.Client شکست خورد: {e}")
+    logger.warning(f"⚠️ بررسی امضاها شکست خورد: {e}")
 # ─── تنظیمات ────────────────────────────────────────────────────────────────
 TOKEN = os.environ["BOT_TOKEN"]                       # توکن ربات روبیکا
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")     # برای Pro Social API (اختیاری)
