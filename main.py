@@ -58,9 +58,14 @@ def _rubino_login_worker(phone: str, code_queue: "queue.Queue", result_queue: "q
     original_input = builtins.input
 
     def fake_input(prompt=""):
-        logger.info(f"🔑 rubino login prompt: {prompt}")
-        return code_queue.get()
-
+    logger.info(f"🔑 rubino login prompt: {prompt}")
+    p = (prompt or "").lower()
+    # اگه پرامپت مربوط به خودِ شماره تلفنه، شماره رو مستقیم برگردون
+    # (نه اینکه منتظر صف بمونیم - صف فقط برای کد تاییده)
+    if "phone" in p or "شماره" in p:
+        return phone
+    # هر پرامپت دیگه (کد تایید، پسورد دومرحله‌ای و ...) از صف میاد
+    return code_queue.get()
     builtins.input = fake_input
     try:
         from rubpy import Client
