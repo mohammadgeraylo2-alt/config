@@ -28,18 +28,19 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 logger = logging.getLogger(__name__)
 
 try:
-    import inspect
     from rubpy import Client as RubpyClient
-    login_methods = [m for m in dir(RubpyClient) if not m.startswith('_') and
-                      any(k in m.lower() for k in ('code', 'login', 'sign', 'auth', 'start', 'register'))]
-    logger.info(f"🔍 متدهای لاگین rubpy.Client: {login_methods}")
-    for m in login_methods:
+    tmp_client = RubpyClient("tmp_probe")
+    key_attrs = [a for a in dir(tmp_client) if not a.startswith('_') and
+                 any(k in a.lower() for k in ('key', 'crypto', 'rsa'))]
+    logger.info(f"🔍 اتریبیوت‌های کلیدی client: {key_attrs}")
+    for a in key_attrs:
         try:
-            logger.info(f"🔍 امضای {m}: {inspect.signature(getattr(RubpyClient, m))}")
+            val = getattr(tmp_client, a)
+            logger.info(f"🔍 {a} = {type(val)} -> {str(val)[:200]}")
         except Exception as ie:
-            logger.info(f"🔍 امضای {m}: قابل خوندن نیست ({ie})")
+            logger.info(f"🔍 {a}: خطا در خوندن ({ie})")
 except Exception as e:
-    logger.warning(f"⚠️ بررسی rubpy.Client شکست خورد: {e}")
+    logger.warning(f"⚠️ بررسی client instance شکست خورد: {e}")
 # ─── تنظیم مسیر ffmpeg (لازم برای تشخیص آهنگ از ویدیو) ──────────────────────
 try:
     import imageio_ffmpeg
