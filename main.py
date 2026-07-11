@@ -30,11 +30,11 @@ logger = logging.getLogger(__name__)
 try:
     from rubpy import Client as RubpyClient
     tmp_client = RubpyClient("tmp_probe")
-    key_attrs = [a for a in dir(tmp_client) if not a.startswith('_') and
-                 any(k in a.lower() for k in ('key', 'crypto', 'rsa'))]
-    logger.info(f"🔍 اتریبیوت‌های کلیدی client: {key_attrs}")
+    logger.info(f"🔍 نوع client.key: {type(tmp_client.key)}")
+    key_dir = [a for a in dir(tmp_client.key) if not a.startswith('_')]
+    logger.info(f"🔍 اتریبیوت‌های client.key: {key_dir}")
 except Exception as e:
-    logger.warning(f"⚠️ بررسی client instance شکست خورد: {e}")
+    logger.warning(f"⚠️ بررسی client.key شکست خورد: {e}")
 # ─── تنظیمات ────────────────────────────────────────────────────────────────
 TOKEN = os.environ["BOT_TOKEN"]                       # توکن ربات روبیکا
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")     # برای Pro Social API (اختیاری)
