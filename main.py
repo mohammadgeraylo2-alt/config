@@ -29,11 +29,17 @@ logger = logging.getLogger(__name__)
 
 try:
     import inspect
-    from rubpy import Rubino
-    logger.info(f"🔍 امضای __init__: {inspect.signature(Rubino.__init__)}")
-    logger.info(f"🔍 امضای get_post_by_share_link: {inspect.signature(Rubino.get_post_by_share_link)}")
+    from rubpy import Client as RubpyClient
+    login_methods = [m for m in dir(RubpyClient) if not m.startswith('_') and
+                      any(k in m.lower() for k in ('code', 'login', 'sign', 'auth', 'start', 'register'))]
+    logger.info(f"🔍 متدهای لاگین rubpy.Client: {login_methods}")
+    for m in login_methods:
+        try:
+            logger.info(f"🔍 امضای {m}: {inspect.signature(getattr(RubpyClient, m))}")
+        except Exception as ie:
+            logger.info(f"🔍 امضای {m}: قابل خوندن نیست ({ie})")
 except Exception as e:
-    logger.warning(f"⚠️ بررسی Rubino شکست خورد: {e}")
+    logger.warning(f"⚠️ بررسی rubpy.Client شکست خورد: {e}")
 # ─── تنظیم مسیر ffmpeg (لازم برای تشخیص آهنگ از ویدیو) ──────────────────────
 try:
     import imageio_ffmpeg
