@@ -27,6 +27,12 @@ from rubka.button import InlineBuilder
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+try:
+    from rubpy import Rubino
+    logger.info(f"🔍 متدهای Rubino: {[m for m in dir(Rubino) if not m.startswith('_')]}")
+except Exception as e:
+    logger.warning(f"⚠️ ایمپورت Rubino شکست خورد: {e}")
+
 # ─── تنظیم مسیر ffmpeg (لازم برای تشخیص آهنگ از ویدیو) ──────────────────────
 try:
     import imageio_ffmpeg
