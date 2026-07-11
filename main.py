@@ -29,27 +29,11 @@ logger = logging.getLogger(__name__)
 
 try:
     from rubpy import Client as RubpyClient
-    tmp_client = RubpyClient("tmp_probe")
-    key_attrs = [a for a in dir(tmp_client) if not a.startswith('_') and
-                 any(k in a.lower() for k in ('key', 'crypto', 'rsa'))]
-    logger.info(f"🔍 اتریبیوت‌های کلیدی client: {key_attrs}")
-    for a in key_attrs:
-        try:
-            val = getattr(tmp_client, a)
-            logger.info(f"🔍 {a} = {type(val)} -> {str(val)[:200]}")
-        except Exception as ie:
-            logger.info(f"🔍 {a}: خطا در خوندن ({ie})")
+    login_methods = [m for m in dir(RubpyClient) if not m.startswith('_') and
+                      any(k in m.lower() for k in ('code', 'login', 'sign', 'auth', 'start', 'register'))]
+    logger.info(f"🔍 متدهای لاگین rubpy.Client: {login_methods}")
 except Exception as e:
-    logger.warning(f"⚠️ بررسی client instance شکست خورد: {e}")
-# ─── تنظیم مسیر ffmpeg (لازم برای تشخیص آهنگ از ویدیو) ──────────────────────
-try:
-    import imageio_ffmpeg
-    _FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-except Exception as _e:
-    import shutil
-    _FFMPEG_EXE = shutil.which("ffmpeg") or "ffmpeg"
-    logger.warning(f"imageio_ffmpeg لود نشد، از ffmpeg سیستم استفاده میشه: {_e}")
-
+    logger.warning(f"⚠️ بررسی rubpy.Client شکست خورد: {e}")
 # ─── تنظیمات ────────────────────────────────────────────────────────────────
 TOKEN = os.environ["BOT_TOKEN"]                       # توکن ربات روبیکا
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")     # برای Pro Social API (اختیاری)
