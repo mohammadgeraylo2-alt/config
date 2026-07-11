@@ -96,15 +96,16 @@ async def _watch_rubino_login(chat_id, result_queue):
 async def rubino_login_cmd(bot: Robot, message: Message):
     if not ADMIN_CHAT_ID or message.sender_id != ADMIN_CHAT_ID:
         return
+    @bot.on_message(commands=["rubino_login"])
+async def rubino_login_cmd(bot: Robot, message: Message):
+    if not ADMIN_CHAT_ID or message.sender_id != ADMIN_CHAT_ID:
+        return
+    logger.info(f"DEBUG rubino_login text={message.text!r}")
     parts = (message.text or "").split()
     if len(parts) < 2:
-        await _rx(message.reply("فرمت: /rubino_code 12345"))
+        await _rx(message.reply("فرمت: /rubino_login 989123456789"))
         return
-    q = _rubino_login_state.get("code_queue")
-    if not q:
-        await _rx(message.reply("❌ اول /rubino_login رو بزن."))
-        return
-    q.put(parts[1])
+    phone = parts[1]
     await _rx(message.reply("⏳ در حال بررسی کد..."))
 
 
