@@ -28,11 +28,12 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 logger = logging.getLogger(__name__)
 
 try:
+    import inspect
     from rubpy import Rubino
-    logger.info(f"🔍 متدهای Rubino: {[m for m in dir(Rubino) if not m.startswith('_')]}")
+    logger.info(f"🔍 امضای __init__: {inspect.signature(Rubino.__init__)}")
+    logger.info(f"🔍 امضای get_post_by_share_link: {inspect.signature(Rubino.get_post_by_share_link)}")
 except Exception as e:
-    logger.warning(f"⚠️ ایمپورت Rubino شکست خورد: {e}")
-
+    logger.warning(f"⚠️ بررسی Rubino شکست خورد: {e}")
 # ─── تنظیم مسیر ffmpeg (لازم برای تشخیص آهنگ از ویدیو) ──────────────────────
 try:
     import imageio_ffmpeg
