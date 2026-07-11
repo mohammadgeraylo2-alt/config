@@ -58,11 +58,13 @@ def _rubino_login_worker(phone: str, code_queue: "queue.Queue", result_queue: "q
     original_input = builtins.input
 
     def fake_input(prompt=""):
-        logger.info(f"🔑 rubino login prompt: {prompt}")
-        p = (prompt or "").lower()
-        if "phone" in p or "شماره" in p:
-            return phone
-        return code_queue.get()
+    logger.info(f"🔑 rubino login prompt: {prompt}")
+    p = (prompt or "").lower()
+    if "phone" in p or "شماره" in p:
+        return phone
+    if "correct" in p or "[y or n]" in p or "y/n" in p:
+        return "y"
+    return code_queue.get()
 
     builtins.input = fake_input
     try:
