@@ -101,6 +101,28 @@ async def rubino_login_cmd(bot: Robot, message: Message):
         await _rx(message.reply("فرمت: /rubino_login 989123456789"))
         return
     phone = parts[1]
+    code_queue = queue.Queue()
+    result_queue = queue.Queue()
+    _rubino_login_state["code_queue"] = code_queue
+    t = threading.Thread(target=_rubino_login_worker, args=(phone, code_queue, result_queue), daemon=True)
+    t.start()
+    await _rx(message.reply("📲 منتظر کد تایید هستم. وقتی رسید بفرست:\n/rubino_code 12345"))
+    _spawn(_watch_rubino_login(message.chat_id, result_queue))
+
+
+@bot.on_message(commands=["rubino_code"])
+async def rubino_code_cmd(bot: Robot, message: Message):
+    if not ADMIN_CHAT_ID or message.sender_id != ADMIN_CHAT_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await _rx(message.reply("فرمت: /rubino_code 12345"))
+        return
+    q = _rubino_login_state.get("code_queue")
+    if not q:
+        await _rx(message.reply("❌ اول /rubino_login رو بزن."))
+        return
+    q.put(parts[1])
     await _rx(message.reply("⏳ در حال بررسی کد..."))
 
 
