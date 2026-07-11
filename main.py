@@ -27,14 +27,79 @@ from rubka.button import InlineBuilder
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-try:
-    from rubpy import Client as RubpyClient
-    tmp_client = RubpyClient("tmp_probe")
-    logger.info(f"🔍 نوع client.key: {type(tmp_client.key)}")
-    key_dir = [a for a in dir(tmp_client.key) if not a.startswith('_')]
-    logger.info(f"🔍 اتریبیوت‌های client.key: {key_dir}")
-except Exception as e:
-    logger.warning(f"⚠️ بررسی client.key شکست خورد: {e}")
+import threading
+import queue
+import base64
+
+_rubino_login_state = {}
+
+
+def _rubino_login_worker(phone: str, code_queue: "queue.Queue", result_queue: "queue.Queue"):
+    import builtins
+    original_input = builtins.input
+
+    def fake_input(prompt=""):
+        logger.info(f"🔑 rubino login prompt: {prompt}")
+        return code_queue.get()
+
+    builtins.input = fake_input
+    try:
+        from rubpy import Client
+        with Client("rubino_acc") as client:
+            client.start(phone_number=phone)
+        result_queue.put(("ok", None))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+    finally:
+        builtins.input = original_input
+
+
+async def _watch_rubino_login(chat_id, result_queue):
+    status, err = await asyncio.to_thread(result_queue.get)
+    if status == "ok":
+        try:
+            with open("rubino_acc.session", "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            await _rx(bot.send_message(chat_id, "✅ لاگین موفق شد. این مقدار رو توی Railway به‌عنوان RUBINO_SESSION_B64 ذخیره کن، بعد این پیام رو از چت پاک کن:"))
+            await _rx(bot.send_message(chat_id, b64))
+        except Exception as e:
+            await _rx(bot.send_message(chat_id, f"⚠️ لاگین شد ولی خوندن session خطا داد: {e}"))
+    else:
+        await _rx(bot.send_message(chat_id, f"❌ لاگین ناموفق: {err}"))
+
+
+@bot.on_message(commands=["rubino_login"])
+async def rubino_login_cmd(bot: Robot, message: Message):
+    if not ADMIN_CHAT_ID or message.sender_id != ADMIN_CHAT_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await _rx(message.reply("فرمت: /rubino_login 989123456789"))
+        return
+    phone = parts[1]
+    code_queue = queue.Queue()
+    result_queue = queue.Queue()
+    _rubino_login_state["code_queue"] = code_queue
+    t = threading.Thread(target=_rubino_login_worker, args=(phone, code_queue, result_queue), daemon=True)
+    t.start()
+    await _rx(message.reply("📲 منتظر کد تایید هستم. وقتی رسید بفرست:\n/rubino_code 12345"))
+    _spawn(_watch_rubino_login(message.chat_id, result_queue))
+
+
+@bot.on_message(commands=["rubino_code"])
+async def rubino_code_cmd(bot: Robot, message: Message):
+    if not ADMIN_CHAT_ID or message.sender_id != ADMIN_CHAT_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await _rx(message.reply("فرمت: /rubino_code 12345"))
+        return
+    q = _rubino_login_state.get("code_queue")
+    if not q:
+        await _rx(message.reply("❌ اول /rubino_login رو بزن."))
+        return
+    q.put(parts[1])
+    await _rx(message.reply("⏳ در حال بررسی کد..."))
 # ─── تنظیمات ────────────────────────────────────────────────────────────────
 TOKEN = os.environ["BOT_TOKEN"]                       # توکن ربات روبیکا
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")     # برای Pro Social API (اختیاری)
