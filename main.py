@@ -91,11 +91,6 @@ async def _watch_rubino_login(chat_id, result_queue):
     else:
         await _rx(bot.send_message(chat_id, f"❌ لاگین ناموفق: {err}"))
 
-
-@bot.on_message(commands=["rubino_login"])
-async def rubino_login_cmd(bot: Robot, message: Message):
-    if not ADMIN_CHAT_ID or message.sender_id != ADMIN_CHAT_ID:
-        return
     @bot.on_message(commands=["rubino_login"])
 async def rubino_login_cmd(bot: Robot, message: Message):
     if not ADMIN_CHAT_ID or message.sender_id != ADMIN_CHAT_ID:
