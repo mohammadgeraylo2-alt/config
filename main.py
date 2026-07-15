@@ -1404,7 +1404,7 @@ _RUBINO_WORKER = None
 # میشه؛ این عدد رو کم نگه داشتیم (۲ تا) چون لاگین هم‌زمان چند پروسه با یه
 # session، طبق تصمیم خودت، یه ریسک قابل قبول ولی واقعیه (ممکنه پلتفرم
 # روبینو این کارو مشکوک تشخیص بده و session رو باطل کنه).
-RUBINO_WORKER_POOL_SIZE = 2
+RUBINO_WORKER_POOL_SIZE = 7
 
 
 class RubinoWorkerPool:
