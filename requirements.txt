@@ -7,3 +7,4 @@ Pillow>=10.0.0
 audioop-lts
 rubpy
 pyrubi
+nudenet
