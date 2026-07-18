@@ -4,7 +4,7 @@ yt-dlp
 shazamio>=0.6.0
 imageio-ffmpeg
 Pillow>=10.0.0
-audioop-lts
+audioop-lts; python_version >= "3.13"
 rubpy
 pyrubi
 --extra-index-url https://download.pytorch.org/whl/cpu
