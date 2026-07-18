@@ -1,4 +1,4 @@
-rubka>=8.1.7
+rubka==7.5.7
 requests
 yt-dlp
 shazamio>=0.6.0
