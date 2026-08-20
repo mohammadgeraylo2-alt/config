@@ -18,11 +18,7 @@ print("کد تأیید به روبیکا/شماره ارسال شد.")
 code = input("کد تأیید: ").strip()
 
 # ورود
-result = client.signIn(
-    phone,
-    code,
-    phone_code_hash
-)
+result = cl
 
 print("Login result:")
 print(result)
