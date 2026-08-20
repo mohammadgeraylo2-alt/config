@@ -278,7 +278,7 @@ def submit_login_code(session_name: str, phone: str, code: str, send_code_result
                 phone_code=code,
                 phone_number=phone,
                 phone_code_hash=phone_code_hash,
-                public_key=public_key_pem,
+                public_key=strip_pem_headers(public_key_pem),
             )
             # ============================================================================
             return result
@@ -300,7 +300,7 @@ def submit_login_code(session_name: str, phone: str, code: str, send_code_result
             f"{type(e).__name__}: {e}\n\n"
             f"دیباگ — phone_code_hash استفاده‌شده: {phone_code_hash!r}\n"
             f"خروجی خام کامل send_code: {send_code_result!r}\n"
-            f"طول public_key ارسالی: {len(public_key_pem)} کاراکتر"
+            f"طول public_key ارسالی (بدون هدر PEM): {len(strip_pem_headers(public_key_pem))} کاراکتر"
         )
 
 
