@@ -52,7 +52,7 @@ SESSIONS_DIR = "login_sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 # فقط یک فرآیند لاگین در هر لحظه، برای هر chat — نه لیست، نه دیکشنری از چند اکانت
-_pending_login = {}  # chat_id -> {"session_name", "phone", "send_code_result", "public_pem", "private_pem"}
+_pending_login = {}  # chat_id -> {"session_name", "phone", "send_code_result", "public_key_candidates"}
 
 
 def _authorized(chat_id) -> bool:
@@ -73,20 +73,35 @@ def strip_pem_headers(pem: str) -> str:
     return "".join(lines)
 
 
-def generate_rsa_keypair() -> tuple[str, str]:
+def generate_rsa_keypair():
     """
-    جفت‌کلید RSA (۱۰۲۴ بیتی) برای همین یک لاگین می‌سازه.
-    public_key به فرمت خام PKCS#1 (SEQUENCE{n, e}) بدون هدر PEM، چون
-    پروتکل روبیکا این فرمت رو برای sign_in می‌خواد.
+    جفت‌کلید RSA (۱۰۲۴ بیتی) برای همین یک لاگین می‌سازه، و چون فرمت دقیقِ
+    public_key مورد انتظار سرور روبیکا مستند نیست، چند نامزد رایج رو
+    آماده می‌کنه تا submit_login_code به‌ترتیب امتحانشون کنه:
+      - "pkcs1_der_b64": DER خامِ PKCS#1 (SEQUENCE{n, e}) بدون هدر — حدس قبلی.
+      - "spki_der_b64": DER استاندارد X.509 SubjectPublicKeyInfo بدون هدر.
+      - "pem": همون PEM استاندارد کامل (با BEGIN/END).
     """
     if RSA is None:
         raise RuntimeError("pycryptodome نصب نیست")
     key = RSA.generate(1024)
     private_pem = key.export_key().decode()
     pub = key.publickey()
+
     der_pkcs1 = DerSequence([pub.n, pub.e]).encode()
-    public_key_pkcs1_b64 = base64.b64encode(der_pkcs1).decode()
-    return private_pem, public_key_pkcs1_b64
+    pkcs1_der_b64 = base64.b64encode(der_pkcs1).decode()
+
+    spki_der = pub.export_key(format="DER")  # PKCS#8/X.509 SubjectPublicKeyInfo
+    spki_der_b64 = base64.b64encode(spki_der).decode()
+
+    pem = pub.export_key().decode()
+
+    candidates = [
+        ("pkcs1_der_b64", pkcs1_der_b64),
+        ("spki_der_b64", spki_der_b64),
+        ("pem", pem),
+    ]
+    return private_pem, candidates
 
 
 def extract_field(obj, candidates: list[str]):
@@ -126,7 +141,7 @@ def start_login(phone: str):
     session_name = re.sub(r"[^0-9]", "", phone) or "unknown"
 
     try:
-        private_pem, public_pem = generate_rsa_keypair()
+        private_pem, public_key_candidates = generate_rsa_keypair()
     except Exception as e:
         return False, None, None, None, None, f"ساخت کلید RSA شکست خورد: {type(e).__name__}: {e}"
 
@@ -142,50 +157,62 @@ def start_login(phone: str):
         result = run_async(_start())
         # لاگ فقط وضعیت رو ثبت می‌کنه، نه محتوای خام (که ممکنه هش/کد داشته باشه)
         log.info("send_code برای شماره ختم‌شده به %s با موفقیت اجرا شد", phone[-4:])
-        return True, session_name, result, private_pem, public_pem, "کد تایید ارسال شد"
+        return True, session_name, result, private_pem, public_key_candidates, "کد تایید ارسال شد"
     except Exception as e:
         return False, None, None, None, None, f"{type(e).__name__}: {e}"
 
 
-def submit_login_code(session_name: str, phone: str, code: str, send_code_result, public_key_pem: str):
-    """مرحله دوم: تایید کد برای همون یک شماره، روی یه کلاینت تازه."""
+def submit_login_code(session_name: str, phone: str, code: str, send_code_result, public_key_candidates):
+    """
+    مرحله دوم: تایید کد برای همون یک شماره.
+    چون فرمت public_key مستند نیست، به‌ترتیب چند فرمت رو با همون یک کد
+    امتحان می‌کنه تا یکی جواب بده (کد فقط وقتی مصرف می‌شه که سرور واقعاً
+    قبولش کنه؛ رد شدن با INVALID_INPUT کد رو باطل نمی‌کنه).
+    """
     phone_code_hash = extract_field(
         send_code_result, ["phone_code_hash", "code_hash", "hash"]
     )
     if not phone_code_hash:
         return False, None, (
             "phone_code_hash رو از خروجی send_code پیدا نکردم.\n"
-            "برای دیباگ، از /debugsource برای دیدن سورس واقعی send_code/sign_in "
-            "و ساختار دقیق فیلدهای خروجی استفاده کن (این دستور کد/سشن رو چاپ نمی‌کنه)."
+            "با /debugsource سورس واقعی send_code/sign_in رو ببین (کد/سشن چاپ نمی‌شه)."
         )
 
-    async def _submit():
+    async def _attempt(public_key_value):
         client = await _make_client(f"login_{session_name}")
         try:
-            result = await client.sign_in(
+            return await client.sign_in(
                 phone_code=code,
                 phone_number=phone,
                 phone_code_hash=phone_code_hash,
-                public_key=public_key_pem,
+                public_key=public_key_value,
             )
-            return result
         finally:
             await _disconnect_client(client)
 
-    try:
-        result = run_async(_submit())
+    errors = []
+    for fmt_name, public_key_value in public_key_candidates:
+        try:
+            result = run_async(_attempt(public_key_value))
+        except Exception as e:
+            log.warning("sign_in با فرمت %s شکست خورد: %s", fmt_name, type(e).__name__)
+            errors.append(f"{fmt_name}: {type(e).__name__}: {e}")
+            continue
+
         auth_val = extract_field(result, ["auth", "auth_key", "key"])
-        # هرگز کد تایید یا auth رو لاگ نکن — فقط وضعیت موفقیت رو
-        log.info("sign_in اجرا شد؛ auth %s.", "پیدا شد" if auth_val else "پیدا نشد")
+        log.info("sign_in با فرمت %s موفق بود؛ auth %s.", fmt_name, "پیدا شد" if auth_val else "پیدا نشد")
         if auth_val:
-            return True, str(auth_val), "ورود موفق"
+            return True, str(auth_val), f"ورود موفق (فرمت کلید: {fmt_name})"
         return True, None, (
-            "ورود ظاهراً موفق بود ولی فیلد auth رو خودکار پیدا نکردم.\n"
-            "با /debugsource ساختار دقیق خروجی sign_in رو (بدون افشای خودِ کد/سشن) بررسی کن."
+            f"ورود با فرمت {fmt_name} ظاهراً موفق بود ولی فیلد auth رو خودکار پیدا نکردم.\n"
+            "با /debugsource ساختار دقیق خروجی sign_in رو بررسی کن."
         )
-    except Exception as e:
-        log.warning("sign_in شکست خورد: %s", type(e).__name__)
-        return False, None, f"{type(e).__name__}: {e}"
+
+    return False, None, (
+        "ورود با همه‌ی فرمت‌های شناخته‌شده‌ی کلید ناموفق بود:\n" + "\n".join(errors) +
+        "\n\nاگه همه INVALID_INPUT دادن، احتمالاً مشکل از خودِ کد یا phone_code_hash است، "
+        "نه فرمت کلید — با /debugsource بررسی کن یا با /login دوباره کد تازه بگیر."
+    )
 
 
 def debug_rubpy_signatures() -> str:
@@ -304,7 +331,7 @@ def login_process_phone(message):
     phone = message.text.strip()
     status_msg = bot.reply_to(message, "در حال ارسال درخواست کد تایید...")
 
-    ok, session_name, send_code_result, private_pem, public_pem, detail = start_login(phone)
+    ok, session_name, send_code_result, private_pem, public_key_candidates, detail = start_login(phone)
     if not ok:
         _pending_login.pop(chat_id, None)
         bot.edit_message_text(
@@ -319,7 +346,7 @@ def login_process_phone(message):
         "session_name": session_name,
         "phone": phone,
         "send_code_result": send_code_result,
-        "public_pem": public_pem,
+        "public_key_candidates": public_key_candidates,
     }
     bot.edit_message_text(
         f"{detail}. حالا کدی که برای همین اکانت اومد رو بفرست.\n"
@@ -344,7 +371,7 @@ def login_process_code(message):
 
     ok, auth, detail = submit_login_code(
         pending["session_name"], pending["phone"], code,
-        pending["send_code_result"], pending["public_pem"],
+        pending["send_code_result"], pending["public_key_candidates"],
     )
     if not ok:
         bot.edit_message_text(
