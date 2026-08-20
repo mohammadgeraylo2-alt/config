@@ -36,6 +36,11 @@ try:
 except ImportError:
     Client = None
 
+try:
+    from Crypto.PublicKey import RSA
+except ImportError:
+    RSA = None
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("auth-checker-rubpy")
 
@@ -82,6 +87,29 @@ def build_kwargs(func, concept_values: dict) -> dict:
                 kwargs[name] = value
                 break
     return kwargs
+
+
+def generate_rsa_keypair() -> tuple[str, str]:
+    """جفت‌کلید RSA (1024 بیتی، فرمت PEM) برای فلوی لاگین می‌سازه."""
+    if RSA is None:
+        raise RuntimeError("pycryptodome نصب نیست")
+    key = RSA.generate(1024)
+    private_pem = key.export_key().decode()
+    public_pem = key.publickey().export_key().decode()
+    return private_pem, public_pem
+
+
+def extract_field(obj, candidates: list[str]):
+    """
+    یه مقدار رو از یه شیء (dict یا Update یا هرچیز دیگه) با چند اسم
+    احتمالی امتحان می‌کنه — چون نمی‌دونیم دقیقاً attribute هست یا key.
+    """
+    for name in candidates:
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return None
 
 
 async def _make_client(session_name: str):
@@ -186,73 +214,65 @@ def debugrubpy_cmd(message):
 
 
 def start_login(phone: str):
-    """مرحله اول: ساخت Client و ارسال کد تایید."""
+    """مرحله اول: ساخت Client، ساخت کلید RSA، و ارسال کد تایید."""
     if Client is None:
-        return False, None, None, "کتابخونه rubpy نصب نیست"
+        return False, None, None, None, None, "کتابخونه rubpy نصب نیست"
 
     phone = phone.strip()
     session_name = re.sub(r"[^0-9]", "", phone) or "unknown"
 
+    try:
+        private_pem, public_pem = generate_rsa_keypair()
+    except Exception as e:
+        return False, None, None, None, None, f"ساخت کلید RSA شکست خورد: {type(e).__name__}: {e}"
+
     async def _start():
         client = await _make_client(f"login_{session_name}")
-        send_code_fn = getattr(client, "send_code", None)
-        if send_code_fn is None:
-            raise AttributeError(
-                "متد send_code روی Client پیدا نشد. با /debugrubpy اسم درست رو پیدا کن."
-            )
-        kwargs = build_kwargs(send_code_fn, {"phone": phone})
-        if kwargs:
-            result = await send_code_fn(**kwargs)
-        else:
-            result = await send_code_fn(phone)
+        # ==== send_code(phone_number, pass_key=None, send_type='SMS') ====
+        result = await client.send_code(phone_number=phone)
+        # ====================================================================
         return client, result
 
     try:
         client, result = run_async(_start())
-        return True, client, result, "کد تایید ارسال شد"
+        return True, client, result, private_pem, public_pem, "کد تایید ارسال شد"
     except Exception as e:
-        return False, None, None, f"{type(e).__name__}: {e}"
+        return False, None, None, None, None, f"{type(e).__name__}: {e}"
 
 
-def submit_login_code(client, phone: str, code: str, send_code_result):
-    """مرحله دوم: فرستادن کد تایید و گرفتن سشن نهایی."""
+def submit_login_code(client, phone: str, code: str, send_code_result, public_key_pem: str):
+    """مرحله دوم: فرستادن کد تایید + کلید عمومی، و گرفتن نتیجه لاگین."""
+
+    phone_code_hash = extract_field(
+        send_code_result, ["phone_code_hash", "code_hash", "hash", "pass_key"]
+    )
+    if not phone_code_hash:
+        return False, None, (
+            "phone_code_hash رو از خروجی send_code پیدا نکردم. خروجی خام:\n"
+            f"{send_code_result!r}"
+        )
 
     async def _submit():
-        sign_in_fn = getattr(client, "sign_in", None)
-        if sign_in_fn is None:
-            raise AttributeError(
-                "متد sign_in روی Client پیدا نشد. با /debugrubpy اسم درست رو پیدا کن."
-            )
-
-        # مقادیر ممکن برای پارامترهای sign_in: شماره، کد، و هر چیزی که از
-        # send_code برگشته (معمولاً phone_code_hash یا مشابهش)
-        concept_values = {"phone": phone, "code": code}
-        if isinstance(send_code_result, dict):
-            for k, v in send_code_result.items():
-                if "hash" in k.lower():
-                    concept_values["hash"] = v
-        elif hasattr(send_code_result, "phone_code_hash"):
-            concept_values["hash"] = getattr(send_code_result, "phone_code_hash")
-
-        kwargs = build_kwargs(sign_in_fn, concept_values)
-        if kwargs:
-            result = await sign_in_fn(**kwargs)
-        else:
-            result = await sign_in_fn(phone, code)
-
-        # سعی می‌کنیم auth نهایی رو از خود client یا نتیجه پیدا کنیم
-        auth_val = getattr(client, "auth", None) or getattr(client, "auth_key", None)
+        # ==== sign_in(phone_code, phone_number, phone_code_hash, public_key) ====
+        result = await client.sign_in(
+            phone_code=code,
+            phone_number=phone,
+            phone_code_hash=phone_code_hash,
+            public_key=public_key_pem,
+        )
+        # ============================================================================
         await _disconnect_client(client)
-        return auth_val, result
+        return result
 
     try:
-        auth_val, result = run_async(_submit())
+        result = run_async(_submit())
+        auth_val = extract_field(result, ["auth", "auth_key", "key"])
         if auth_val:
             return True, str(auth_val), "ورود موفق"
         return True, None, (
-            "ورود موفق ولی auth رو خودکار پیدا نکردم — سشن تو فایل "
-            f"{SESSIONS_DIR}/login_{re.sub(r'[^0-9]', '', phone)}.session ذخیره شده، "
-            "با /debugrubpy بررسی کن اسم اتریبیوت auth چیه."
+            "ورود ظاهراً موفق بود ولی فیلد auth رو خودکار پیدا نکردم. خروجی خام sign_in:\n"
+            f"{result!r}\n\n"
+            "این رو برای من بفرست تا فیلد درست رو پیدا کنم."
         )
     except Exception as e:
         return False, None, f"{type(e).__name__}: {e}"
@@ -277,7 +297,7 @@ def login_process_phone(message):
     phone = message.text.strip()
     status_msg = bot.reply_to(message, "در حال ارسال درخواست کد تایید...")
 
-    ok, client, send_code_result, detail = start_login(phone)
+    ok, client, send_code_result, private_pem, public_pem, detail = start_login(phone)
     if not ok:
         bot.edit_message_text(
             f"ارسال کد ناموفق بود: {detail}\nبا /debugrubpy امضای واقعی متدها رو چک کن.",
@@ -290,6 +310,8 @@ def login_process_phone(message):
         "client": client,
         "phone": phone,
         "send_code_result": send_code_result,
+        "private_pem": private_pem,
+        "public_pem": public_pem,
     }
     bot.edit_message_text(
         f"{detail}. حالا کدی که برای اکانت {phone} اومد رو بفرست.",
@@ -309,7 +331,8 @@ def login_process_code(message):
     status_msg = bot.reply_to(message, "در حال بررسی کد...")
 
     ok, auth, detail = submit_login_code(
-        pending["client"], pending["phone"], code, pending["send_code_result"]
+        pending["client"], pending["phone"], code,
+        pending["send_code_result"], pending["public_pem"],
     )
     if not ok:
         bot.edit_message_text(
