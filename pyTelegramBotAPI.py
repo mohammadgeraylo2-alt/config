@@ -89,6 +89,19 @@ def build_kwargs(func, concept_values: dict) -> dict:
     return kwargs
 
 
+def strip_pem_headers(pem: str) -> str:
+    """
+    از یه رشته PEM فقط محتوای base64 خام رو برمی‌گردونه (بدون خط‌های
+    BEGIN/END و بدون خط جدید). چون روبیکا (برخلاف استاندارد PEM) این
+    فرمت خام رو برای public_key می‌خواد.
+    """
+    lines = [
+        line.strip() for line in pem.strip().splitlines()
+        if line.strip() and not line.startswith("-----")
+    ]
+    return "".join(lines)
+
+
 def generate_rsa_keypair() -> tuple[str, str]:
     """جفت‌کلید RSA (1024 بیتی، فرمت PEM) برای فلوی لاگین می‌سازه."""
     if RSA is None:
@@ -527,3 +540,4 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده! توی Railway، متغیر محیطی BOT_TOKEN رو ست کن.")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
+  
