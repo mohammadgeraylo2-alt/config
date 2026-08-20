@@ -1,2 +1,2 @@
 pyTelegramBotAPI
-pyrubi
+pyrubi==3.6.0
