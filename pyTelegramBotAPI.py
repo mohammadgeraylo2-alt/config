@@ -1,190 +1,110 @@
 import os
-import re
 import json
 import logging
-from typing import Optional
+from typing import List, Dict, Tuple
 
 import telebot
 from telebot import types
 
-try:
-    from pyrubi import Client
-except ImportError:
-    Client = None
+from pyrubi import Client
 
 
 # ============================================================
-# تنظیمات
+# CONFIG
 # ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN تنظیم نشده است. "
-        "در Railway متغیر محیطی BOT_TOKEN را تنظیم کن."
-    )
+    raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-log = logging.getLogger("rubika-session-checker")
+log = logging.getLogger("rubika-bot")
 
 
 # ============================================================
-# State
+# MEMORY STATE
 # ============================================================
 
-waiting_for_sessions = set()
-waiting_for_channel = set()
+waiting_sessions = set()
+waiting_channel = set()
 
-# chat_id -> list[dict]
-# هر مورد:
-# {
-#   "auth": "...",
-#   "private": "..."
-# }
-healthy_sessions_by_chat = {}
+healthy_sessions = {}
 
 
 # ============================================================
-# ابزارهای عمومی
+# CLIENT
 # ============================================================
 
-def safe_error(exc: Exception) -> str:
+def create_client(auth: str, private: str):
     """
-    خطا را کوتاه و قابل نمایش می‌کند.
-    برای جلوگیری از چاپ اطلاعات حساس، خود auth/private را نمایش نمی‌دهیم.
-    """
-    text = str(exc).strip()
-
-    if not text:
-        return type(exc).__name__
-
-    if len(text) > 500:
-        text = text[:500] + "..."
-
-    return f"{type(exc).__name__}: {text}"
-
-
-def make_client(auth: str, private: str):
-    """
-    ساخت Client با روش مستند Pyrubi 3.6.0.
+    Pyrubi 3.6.0:
+        Client(auth=..., private=...)
     """
 
-    if Client is None:
-        raise RuntimeError(
-            "کتابخانه pyrubi نصب نیست. "
-            "در requirements.txt آن را اضافه کن."
-        )
-
-    auth = auth.strip()
-    private = private.strip()
-
-    if not auth:
-        raise ValueError("auth خالی است.")
-
-    if not private:
-        raise ValueError("private key خالی است.")
-
-    # روش مستند Pyrubi برای session دستی
     return Client(
-        auth=auth,
-        private=private,
+        auth=auth.strip(),
+        private=private.strip()
     )
 
 
 # ============================================================
-# Parse session
+# PARSE
 # ============================================================
 
-def parse_sessions(raw: str):
-    """
-    ورودی‌های قابل قبول:
+def parse_sessions(text: str) -> List[Dict[str, str]]:
 
-    حالت خطی:
-        auth1|private1
-        auth2|private2
+    text = text.strip()
 
-    JSON:
-        [
-            {
-                "auth": "AUTH1",
-                "private": "PRIVATE1"
-            },
-            {
-                "auth": "AUTH2",
-                "private": "PRIVATE2"
-            }
-        ]
-
-    همچنین JSON ساده:
-        [
-            ["AUTH1", "PRIVATE1"],
-            ["AUTH2", "PRIVATE2"]
-        ]
-    """
-
-    raw = raw.strip()
-
-    if not raw:
+    if not text:
         return []
 
-    # --------------------------------------------------------
     # JSON
-    # --------------------------------------------------------
+    if text.startswith("["):
 
-    if raw.startswith("[") and raw.endswith("]"):
         try:
-            data = json.loads(raw)
+            data = json.loads(text)
 
-            sessions = []
+            result = []
 
             for item in data:
 
-                if isinstance(item, dict):
-                    auth = str(item.get("auth", "")).strip()
-                    private = str(item.get("private", "")).strip()
-
-                elif isinstance(item, list) and len(item) >= 2:
-                    auth = str(item[0]).strip()
-                    private = str(item[1]).strip()
-
-                else:
+                if not isinstance(item, dict):
                     continue
 
+                auth = str(
+                    item.get("auth", "")
+                ).strip()
+
+                private = str(
+                    item.get("private", "")
+                ).strip()
+
                 if auth and private:
-                    sessions.append(
-                        {
-                            "auth": auth,
-                            "private": private,
-                        }
-                    )
+                    result.append({
+                        "auth": auth,
+                        "private": private
+                    })
 
-            return sessions
+            return result
 
-        except json.JSONDecodeError:
+        except Exception:
             pass
 
-    # --------------------------------------------------------
-    # حالت خط به خط
     # auth|private
-    # --------------------------------------------------------
+    result = []
 
-    sessions = []
-
-    for line in raw.splitlines():
+    for line in text.splitlines():
 
         line = line.strip()
 
-        if not line:
-            continue
-
-        if "|" not in line:
+        if not line or "|" not in line:
             continue
 
         auth, private = line.split("|", 1)
@@ -193,179 +113,166 @@ def parse_sessions(raw: str):
         private = private.strip()
 
         if auth and private:
-            sessions.append(
-                {
-                    "auth": auth,
-                    "private": private,
-                }
-            )
+            result.append({
+                "auth": auth,
+                "private": private
+            })
 
-    return sessions
+    return result
 
 
 # ============================================================
-# Check session
+# CHECK SESSION
 # ============================================================
 
-def check_single_session(auth: str, private: str):
-    """
-    بررسی می‌کند session قابل استفاده است یا نه.
-
-    اول get_me را امتحان می‌کند.
-    اگر نسخه نصب‌شده get_me نداشت، get_chats را امتحان می‌کند.
-    """
+def check_session(
+    auth: str,
+    private: str
+) -> Tuple[bool, str]:
 
     try:
 
-        client = make_client(auth, private)
+        client = create_client(
+            auth,
+            private
+        )
 
-        # روش ترجیحی
-        get_me = getattr(client, "get_me", None)
+        # get_me اگر موجود باشد
+        method = getattr(
+            client,
+            "get_me",
+            None
+        )
 
-        if callable(get_me):
-            result = get_me()
+        if callable(method):
+
+            result = method()
 
             if result is not None:
                 return True, "سالم"
 
-            return False, "get_me پاسخ خالی داد"
+        # fallback
+        method = getattr(
+            client,
+            "get_chats",
+            None
+        )
 
-        # روش جایگزین
-        get_chats = getattr(client, "get_chats", None)
+        if callable(method):
 
-        if callable(get_chats):
             try:
-                result = get_chats(limit=1)
+                result = method(limit=1)
             except TypeError:
-                result = get_chats()
+                result = method()
 
             if result is not None:
                 return True, "سالم"
 
-            return False, "get_chats پاسخ خالی داد"
+        return False, "متد بررسی حساب پیدا نشد"
 
-        return False, "متد get_me یا get_chats در این نسخه پیدا نشد"
+    except Exception as e:
 
-    except Exception as exc:
+        log.exception(
+            "check_session failed"
+        )
 
-        log.exception("Session check failed")
-
-        return False, safe_error(exc)
+        return False, (
+            f"{type(e).__name__}: "
+            f"{str(e)[:300]}"
+        )
 
 
 # ============================================================
-# Join
+# JOIN
 # ============================================================
 
-def normalize_channel_input(value: str) -> str:
-    """
-    لینک/شناسه کانال را کمی تمیز می‌کند.
-    """
-
-    value = value.strip()
-
-    value = value.replace(
-        "https://rubika.ir/",
-        ""
-    )
-
-    value = value.replace(
-        "http://rubika.ir/",
-        ""
-    )
-
-    value = value.replace(
-        "rubika.ir/",
-        ""
-    )
-
-    return value.strip()
-
-
-def join_channel_with_session(
+def join_channel(
     auth: str,
     private: str,
-    channel: str,
-):
-    """
-    تلاش برای join کردن با session.
-
-    فقط متدی را اجرا می‌کنیم که واقعاً روی Client وجود داشته باشد.
-    """
+    channel: str
+) -> Tuple[bool, str]:
 
     try:
 
-        client = make_client(auth, private)
+        client = create_client(
+            auth,
+            private
+        )
 
-        channel = normalize_channel_input(channel)
-
-        if not channel:
-            return False, "شناسه/لینک کانال خالی است"
+        channel = channel.strip()
 
         # ----------------------------------------------------
-        # 1) اگر شناسه GUID داده شده باشد
+        # لینک دعوت
+        # ----------------------------------------------------
+
+        if (
+            "joinc/" in channel.lower()
+            or "/join/" in channel.lower()
+        ):
+
+            method = getattr(
+                client,
+                "join_channel_by_link",
+                None
+            )
+
+            if callable(method):
+
+                method(channel)
+
+                return True, "عضو شد"
+
+        # ----------------------------------------------------
+        # GUID
         # ----------------------------------------------------
 
         method = getattr(
             client,
             "join_channel_by_guid",
-            None,
+            None
         )
 
         if callable(method):
 
-            result = method(channel)
+            method(channel)
 
-            return True, "عضویت انجام شد"
-
-        # ----------------------------------------------------
-        # 2) اگر لینک دعوت باشد
-        # ----------------------------------------------------
-
-        method = getattr(
-            client,
-            "join_channel_by_link",
-            None,
-        )
-
-        if callable(method):
-
-            # اگر کاربر لینک کامل فرستاده باشد،
-            # نسخه اصلی را دوباره استفاده می‌کنیم.
-            result = method(channel)
-
-            return True, "عضویت انجام شد"
+            return True, "عضو شد"
 
         # ----------------------------------------------------
-        # 3) متد عمومی
+        # generic
         # ----------------------------------------------------
 
         method = getattr(
             client,
             "join_channel",
-            None,
+            None
         )
 
         if callable(method):
 
-            result = method(channel)
+            method(channel)
 
-            return True, "عضویت انجام شد"
+            return True, "عضو شد"
 
-        return (
-            False,
-            "هیچ‌کدام از متدهای join در نسخه نصب‌شده Pyrubi پیدا نشد.",
+        return False, (
+            "متد مناسب Join در نسخه "
+            "نصب‌شده Pyrubi پیدا نشد."
         )
 
-    except Exception as exc:
+    except Exception as e:
 
-        log.exception("Join failed")
+        log.exception(
+            "join_channel failed"
+        )
 
-        return False, safe_error(exc)
+        return False, (
+            f"{type(e).__name__}: "
+            f"{str(e)[:300]}"
+        )
 
 
 # ============================================================
-# /start
+# START
 # ============================================================
 
 @bot.message_handler(
@@ -373,73 +280,52 @@ def join_channel_with_session(
 )
 def start(message):
 
-    text = (
-        "سلام 👋\n\n"
-
-        "این ربات sessionهای Pyrubi را بررسی می‌کند.\n\n"
-
-        "برای شروع:\n"
-        "/check\n\n"
-
-        "بعد sessionها را هر کدام در یک خط بفرست:\n\n"
-
-        "auth1|private1\n"
-        "auth2|private2\n\n"
-
-        "یا به صورت JSON:\n"
-        '[{"auth":"AUTH","private":"PRIVATE"}]\n\n'
-
-        "بعد از بررسی، اگر session سالم وجود داشته باشد، "
-        "می‌توانی شناسه یا لینک کانال را برای عملیات join ارسال کنی.\n\n"
-
-        "⚠️ auth و private اطلاعات حساس حساب هستند. "
-        "آن‌ها را برای افراد دیگر ارسال نکن."
-    )
-
     bot.reply_to(
         message,
-        text,
+        "سلام 👋\n\n"
+        "برای بررسی session:\n"
+        "/check\n\n"
+        "فرمت:\n"
+        "auth|private\n"
+        "auth|private\n\n"
+        "⚠️ شماره، کد ورود یا private key را "
+        "در چت عمومی ارسال نکن."
     )
 
 
 # ============================================================
-# /check
+# CHECK
 # ============================================================
 
 @bot.message_handler(
     commands=["check"]
 )
-def check_start(message):
+def check_command(message):
 
-    chat_id = message.chat.id
-
-    waiting_for_sessions.add(chat_id)
+    waiting_sessions.add(
+        message.chat.id
+    )
 
     bot.reply_to(
         message,
         "sessionها را بفرست.\n\n"
-        "فرمت:\n"
-        "auth|private\n"
-        "auth|private\n\n"
-        "هر session در یک خط.",
+        "هر اکانت در یک خط:\n\n"
+        "auth|private"
     )
 
 
-# ============================================================
-# دریافت sessionها
-# ============================================================
-
 @bot.message_handler(
-    func=lambda m: (
-        m.chat.id in waiting_for_sessions
-    ),
-    content_types=["text"],
+    func=lambda m:
+        m.chat.id in waiting_sessions,
+    content_types=["text"]
 )
-def process_sessions(message):
+def receive_sessions(message):
 
     chat_id = message.chat.id
 
-    waiting_for_sessions.discard(chat_id)
+    waiting_sessions.discard(
+        chat_id
+    )
 
     sessions = parse_sessions(
         message.text
@@ -449,9 +335,9 @@ def process_sessions(message):
 
         bot.reply_to(
             message,
-            "هیچ session معتبری پیدا نشد.\n\n"
-            "فرمت صحیح:\n"
-            "auth|private",
+            "فرمت session درست نیست.\n\n"
+            "باید این‌طور باشد:\n"
+            "auth|private"
         )
 
         return
@@ -460,315 +346,236 @@ def process_sessions(message):
 
         bot.reply_to(
             message,
-            "حداکثر ۵۰ session در هر بار بررسی مجاز است.",
+            "حداکثر ۵۰ session در هر مرحله."
         )
 
         return
 
     status = bot.reply_to(
         message,
-        f"در حال بررسی {len(sessions)} session...",
+        f"در حال بررسی {len(sessions)} اکانت..."
     )
 
-    healthy_sessions = []
+    healthy = []
 
-    result_lines = []
+    lines = []
 
-    for index, session in enumerate(
+    for i, session in enumerate(
         sessions,
-        start=1,
+        1
     ):
 
-        ok, detail = check_single_session(
+        ok, detail = check_session(
             session["auth"],
-            session["private"],
+            session["private"]
         )
 
         if ok:
 
-            healthy_sessions.append(
+            healthy.append(
                 session
             )
 
-            result_lines.append(
-                f"✅ session {index}: سالم"
+            lines.append(
+                f"✅ اکانت {i}: سالم"
             )
 
         else:
 
-            result_lines.append(
-                f"❌ session {index}: {detail}"
+            lines.append(
+                f"❌ اکانت {i}: {detail}"
             )
 
-    summary = (
+    result = (
         "نتیجه بررسی:\n\n"
-        + "\n".join(result_lines)
+        + "\n".join(lines)
         + "\n\n"
-        + f"📊 {len(healthy_sessions)} "
-          f"از {len(sessions)} session سالم است."
+        + f"📊 سالم: {len(healthy)} "
+          f"از {len(sessions)}"
     )
 
-    try:
+    bot.edit_message_text(
+        result,
+        chat_id=chat_id,
+        message_id=status.message_id
+    )
 
-        bot.edit_message_text(
-            summary,
-            chat_id=status.chat.id,
-            message_id=status.message_id,
+    if not healthy:
+        return
+
+    healthy_sessions[
+        chat_id
+    ] = healthy
+
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "Join کانال ✅",
+            callback_data="join_yes"
+        ),
+        types.InlineKeyboardButton(
+            "لغو ❌",
+            callback_data="join_no"
         )
+    )
 
-    except Exception:
-
-        bot.send_message(
-            chat_id,
-            summary,
-        )
-
-    # --------------------------------------------------------
-    # اگر session سالم داریم، مرحله join
-    # --------------------------------------------------------
-
-    if healthy_sessions:
-
-        healthy_sessions_by_chat[
-            chat_id
-        ] = healthy_sessions
-
-        markup = types.InlineKeyboardMarkup()
-
-        markup.row(
-            types.InlineKeyboardButton(
-                "عضویت در کانال ✅",
-                callback_data="join_yes",
-            ),
-            types.InlineKeyboardButton(
-                "لغو",
-                callback_data="join_no",
-            ),
-        )
-
-        bot.send_message(
-            chat_id,
-            (
-                f"{len(healthy_sessions)} session سالم پیدا شد.\n\n"
-                "می‌خواهی با این sessionها وارد کانال شوند؟"
-            ),
-            reply_markup=markup,
-        )
+    bot.send_message(
+        chat_id,
+        f"{len(healthy)} اکانت سالم است.\n"
+        "می‌خواهی وارد کانال شوند؟",
+        reply_markup=keyboard
+    )
 
 
 # ============================================================
-# انتخاب Join
+# JOIN CONFIRMATION
 # ============================================================
 
 @bot.callback_query_handler(
-    func=lambda call: call.data in (
-        "join_yes",
-        "join_no",
-    )
+    func=lambda c:
+        c.data in (
+            "join_yes",
+            "join_no"
+        )
 )
-def handle_join_choice(call):
+def join_confirmation(call):
 
     chat_id = call.message.chat.id
 
-    try:
-        bot.answer_callback_query(
-            call.id
-        )
-    except Exception:
-        pass
+    bot.answer_callback_query(
+        call.id
+    )
 
     if call.data == "join_no":
 
-        healthy_sessions_by_chat.pop(
+        healthy_sessions.pop(
             chat_id,
-            None,
+            None
         )
 
         bot.edit_message_text(
-            "باشه، عملیات join لغو شد.",
+            "عملیات لغو شد.",
             chat_id=chat_id,
-            message_id=call.message.message_id,
+            message_id=call.message.message_id
         )
 
         return
 
-    if chat_id not in healthy_sessions_by_chat:
+    if chat_id not in healthy_sessions:
 
         bot.send_message(
             chat_id,
-            "session سالمی برای این عملیات پیدا نشد. دوباره /check را بزن.",
+            "session سالمی وجود ندارد."
         )
 
         return
 
-    waiting_for_channel.add(
+    waiting_channel.add(
         chat_id
     )
 
     bot.edit_message_text(
-        "حالا لینک یا شناسه کانال روبیکا را بفرست.",
+        "لینک دعوت یا GUID کانال را بفرست.",
         chat_id=chat_id,
-        message_id=call.message.message_id,
+        message_id=call.message.message_id
     )
 
 
 # ============================================================
-# دریافت کانال
+# RECEIVE CHANNEL
 # ============================================================
 
 @bot.message_handler(
-    func=lambda m: (
-        m.chat.id in waiting_for_channel
-    ),
-    content_types=["text"],
+    func=lambda m:
+        m.chat.id in waiting_channel,
+    content_types=["text"]
 )
-def process_channel(message):
+def receive_channel(message):
 
     chat_id = message.chat.id
 
-    waiting_for_channel.discard(
+    waiting_channel.discard(
         chat_id
     )
 
     channel = message.text.strip()
 
-    sessions = healthy_sessions_by_chat.pop(
+    sessions = healthy_sessions.pop(
         chat_id,
-        [],
+        []
     )
 
     if not sessions:
 
         bot.reply_to(
             message,
-            "session سالمی پیدا نشد. دوباره /check را بزن.",
-        )
-
-        return
-
-    if not channel:
-
-        bot.reply_to(
-            message,
-            "لینک یا شناسه کانال خالی است.",
+            "session سالمی پیدا نشد."
         )
 
         return
 
     status = bot.reply_to(
         message,
-        f"در حال بررسی {len(sessions)} session برای join...",
+        f"در حال Join کردن "
+        f"{len(sessions)} اکانت..."
     )
 
-    joined = 0
+    success = 0
+    lines = []
 
-    result_lines = []
-
-    for index, session in enumerate(
+    for i, session in enumerate(
         sessions,
-        start=1,
+        1
     ):
 
-        ok, detail = join_channel_with_session(
+        ok, detail = join_channel(
             session["auth"],
             session["private"],
-            channel,
+            channel
         )
 
         if ok:
 
-            joined += 1
+            success += 1
 
-            result_lines.append(
-                f"✅ session {index}: {detail}"
+            lines.append(
+                f"✅ اکانت {i}: {detail}"
             )
 
         else:
 
-            result_lines.append(
-                f"❌ session {index}: {detail}"
+            lines.append(
+                f"❌ اکانت {i}: {detail}"
             )
 
-    summary = (
-        "نتیجه عملیات:\n\n"
-        + "\n".join(result_lines)
+    result = (
+        "نتیجه Join:\n\n"
+        + "\n".join(lines)
         + "\n\n"
-        + f"📊 موفق: {joined} از {len(sessions)}"
+        + f"📊 موفق: {success} "
+          f"از {len(sessions)}"
     )
 
-    try:
-
-        bot.edit_message_text(
-            summary,
-            chat_id=status.chat.id,
-            message_id=status.message_id,
-        )
-
-    except Exception:
-
-        bot.send_message(
-            chat_id,
-            summary,
-        )
-
-
-# ============================================================
-# مدیریت پیام‌های اشتباه
-# ============================================================
-
-@bot.message_handler(
-    content_types=["text"]
-)
-def fallback(message):
-
-    chat_id = message.chat.id
-
-    # اگر پیام مربوط به یکی از stateها نیست
-    if chat_id in waiting_for_sessions:
-        return
-
-    if chat_id in waiting_for_channel:
-        return
-
-    bot.reply_to(
-        message,
-        "برای شروع /check را بزن.",
+    bot.edit_message_text(
+        result,
+        chat_id=chat_id,
+        message_id=status.message_id
     )
 
 
 # ============================================================
-# اجرا
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
 
     log.info(
-        "Rubika session checker started."
+        "Rubika Telegram bot started."
     )
 
-    log.info(
-        "Pyrubi installed: %s",
-        Client is not None,
+    bot.infinity_polling(
+        skip_pending=True,
+        timeout=30,
+        long_polling_timeout=30
     )
-
-    try:
-
-        bot.infinity_polling(
-            skip_pending=True,
-            timeout=30,
-            long_polling_timeout=30,
-        )
-
-    except KeyboardInterrupt:
-
-        log.info(
-            "Bot stopped by user."
-        )
-
-    except Exception:
-
-        log.exception(
-            "Bot crashed."
-        )
-
-        raise
