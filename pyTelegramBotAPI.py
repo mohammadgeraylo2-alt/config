@@ -38,8 +38,11 @@ except ImportError:
 
 try:
     from Crypto.PublicKey import RSA
+    from Crypto.Util.asn1 import DerSequence
+    import base64
 except ImportError:
     RSA = None
+    DerSequence = None
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("auth-checker-rubpy")
@@ -103,13 +106,24 @@ def strip_pem_headers(pem: str) -> str:
 
 
 def generate_rsa_keypair() -> tuple[str, str]:
-    """جفت‌کلید RSA (1024 بیتی، فرمت PEM) برای فلوی لاگین می‌سازه."""
+    """
+    جفت‌کلید RSA (۱۰۲۴ بیتی) می‌سازه.
+    private_pem: فرمت استاندارد PEM (برای نگه‌داری/دیکود بعدی خودمون).
+    public_key_pkcs1_b64: کلید عمومی به فرمت خام PKCS#1 (فقط modulus + exponent،
+        بدون پوشش X.509)، base64-encode شده و بدون هدر/newline — چون پروتکل
+        روبیکا این فرمت خام رو می‌خواد، نه PEM استاندارد.
+    """
     if RSA is None:
         raise RuntimeError("pycryptodome نصب نیست")
     key = RSA.generate(1024)
     private_pem = key.export_key().decode()
-    public_pem = key.publickey().export_key().decode()
-    return private_pem, public_pem
+
+    # ساخت DER خام PKCS#1: SEQUENCE { INTEGER n, INTEGER e }
+    pub = key.publickey()
+    der_pkcs1 = DerSequence([pub.n, pub.e]).encode()
+    public_key_pkcs1_b64 = base64.b64encode(der_pkcs1).decode()
+
+    return private_pem, public_key_pkcs1_b64
 
 
 def extract_field(obj, candidates: list[str]):
@@ -278,7 +292,7 @@ def submit_login_code(session_name: str, phone: str, code: str, send_code_result
                 phone_code=code,
                 phone_number=phone,
                 phone_code_hash=phone_code_hash,
-                public_key=strip_pem_headers(public_key_pem),
+                public_key=public_key_pem,
             )
             # ============================================================================
             return result
@@ -300,7 +314,7 @@ def submit_login_code(session_name: str, phone: str, code: str, send_code_result
             f"{type(e).__name__}: {e}\n\n"
             f"دیباگ — phone_code_hash استفاده‌شده: {phone_code_hash!r}\n"
             f"خروجی خام کامل send_code: {send_code_result!r}\n"
-            f"طول public_key ارسالی (بدون هدر PEM): {len(strip_pem_headers(public_key_pem))} کاراکتر"
+            f"طول public_key ارسالی (PKCS#1 خام): {len(public_key_pem)} کاراکتر"
         )
 
 
@@ -540,4 +554,4 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده! توی Railway، متغیر محیطی BOT_TOKEN رو ست کن.")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-  
+                        
