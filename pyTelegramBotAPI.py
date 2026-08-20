@@ -283,7 +283,12 @@ def submit_login_code(session_name: str, phone: str, code: str, send_code_result
             "این رو برای من بفرست تا فیلد درست رو پیدا کنم."
         )
     except Exception as e:
-        return False, None, f"{type(e).__name__}: {e}"
+        return False, None, (
+            f"{type(e).__name__}: {e}\n\n"
+            f"دیباگ — phone_code_hash استفاده‌شده: {phone_code_hash!r}\n"
+            f"خروجی خام کامل send_code: {send_code_result!r}\n"
+            f"طول public_key ارسالی: {len(public_key_pem)} کاراکتر"
+        )
 
 
 @bot.message_handler(commands=["login"])
@@ -522,4 +527,3 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده! توی Railway، متغیر محیطی BOT_TOKEN رو ست کن.")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-  
