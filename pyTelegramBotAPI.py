@@ -240,6 +240,36 @@ def debugrubpy_cmd(message):
     bot.reply_to(message, debug_rubpy_signatures())
 
 
+@bot.message_handler(commands=["debugsource"])
+def debugsource_cmd(message):
+    """سورس واقعی sign_in و send_code رو مستقیم از کتابخونه‌ی نصب‌شده چاپ می‌کنه."""
+    if Client is None:
+        bot.reply_to(message, "کتابخونه rubpy نصب نیست.")
+        return
+    try:
+        client = Client(name=os.path.join(SESSIONS_DIR, "debug_probe2"))
+    except Exception as e:
+        bot.reply_to(message, f"ساخت Client شکست خورد: {type(e).__name__}: {e}")
+        return
+
+    report = []
+    for name in ("send_code", "sign_in"):
+        fn = getattr(client, name, None)
+        if fn is None:
+            report.append(f"--- {name}: پیدا نشد ---")
+            continue
+        try:
+            src = inspect.getsource(fn)
+        except Exception as e:
+            src = f"(سورس در دسترس نبود: {type(e).__name__}: {e})"
+        report.append(f"--- {name} ---\n{src}")
+
+    full = "\n\n".join(report)
+    max_len = 3500
+    for i in range(0, len(full), max_len):
+        bot.send_message(message.chat.id, full[i:i + max_len])
+
+
 def start_login(phone: str):
     """مرحله اول: ساخت Client، ساخت کلید RSA، و ارسال کد تایید."""
     if Client is None:
@@ -554,4 +584,3 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده! توی Railway، متغیر محیطی BOT_TOKEN رو ست کن.")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-                        
