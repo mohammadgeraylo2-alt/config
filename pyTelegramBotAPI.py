@@ -150,21 +150,34 @@ def debug_rubpy_signatures() -> str:
         return f"ساخت Client شکست خورد: {type(e).__name__}: {e}"
 
     interesting = [n for n in dir(client) if any(k in n.lower() for k in
-                   ("send_code", "sign_in", "login", "code", "connect", "get_me", "get_chats"))]
+                   ("send_code", "sign_in", "login", "code", "connect", "get_me", "get_chats",
+                    "key", "rsa", "crypto"))]
     if not interesting:
         return "هیچ متد مرتبطی پیدا نشد."
 
     for name in interesting:
-        attr = getattr(client, name)
-        if not callable(attr):
-            continue
         try:
-            sig = inspect.signature(attr)
-            lines.append(f"• {name}{sig}")
-        except (TypeError, ValueError):
-            lines.append(f"• {name}(...) — امضا قابل خوندن نبود")
+            attr = getattr(client, name)
+        except Exception as e:
+            lines.append(f"• {name}: خطا در دسترسی ({type(e).__name__})")
+            continue
+        if callable(attr):
+            try:
+                sig = inspect.signature(attr)
+                lines.append(f"• {name}{sig}  [متد]")
+            except (TypeError, ValueError):
+                lines.append(f"• {name}(...) — امضا قابل خوندن نبود  [متد]")
+        else:
+            lines.append(f"• {name} = {attr!r}  [اتریبیوت]")
 
-    return "امضای متدهای پیدا‌شده روی rubpy Client:\n" + "\n".join(lines)
+    # بررسی وجود ماژول رمزنگاری pycryptodome که rubpy روش ساخته شده
+    try:
+        import Crypto  # noqa: F401
+        lines.append("\npycryptodome نصب است (برای ساخت RSA در دسترس است).")
+    except ImportError:
+        lines.append("\npycryptodome نصب نیست.")
+
+    return "امضای متدها/اتریبیوت‌های پیدا‌شده روی rubpy Client:\n" + "\n".join(lines)
 
 
 @bot.message_handler(commands=["debugrubpy"])
@@ -478,4 +491,4 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده! توی Railway، متغیر محیطی BOT_TOKEN رو ست کن.")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-            
+  
