@@ -210,8 +210,10 @@ def submit_login_code(session_name: str, phone: str, code: str, send_code_result
 
     return False, None, (
         "ورود با همه‌ی فرمت‌های شناخته‌شده‌ی کلید ناموفق بود:\n" + "\n".join(errors) +
-        "\n\nاگه همه INVALID_INPUT دادن، احتمالاً مشکل از خودِ کد یا phone_code_hash است، "
-        "نه فرمت کلید — با /debugsource بررسی کن یا با /login دوباره کد تازه بگیر."
+        "\n\n— دیباگ (فقط همینجا نشون داده می‌شه، جایی لاگ نمی‌شه) —\n"
+        f"phone_code_hash استخراج‌شده: {phone_code_hash!r}\n"
+        f"طول کد وارد شده: {len(code)} کاراکتر\n"
+        f"خروجی خام کامل send_code:\n{send_code_result!r}"
     )
 
 
@@ -457,4 +459,4 @@ if __name__ == "__main__":
         log.warning("OWNER_ID ست نشده — هرکسی که چت رو استارت کنه می‌تونه از /login استفاده کنه.")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-  
+                      
