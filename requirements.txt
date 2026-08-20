@@ -1,2 +1,2 @@
 pyTelegramBotAPI
-rulog==1.0.3
+rubpy
