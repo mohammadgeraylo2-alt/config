@@ -323,7 +323,7 @@ def debugsource_cmd(message):
         return
 
     report = []
-    for name in ("send_code", "sign_in"):
+    for name in ("send_code", "sign_in", "builder"):
         fn = getattr(client, name, None)
         if fn is None:
             report.append(f"--- {name}: پیدا نشد ---")
@@ -457,4 +457,4 @@ if __name__ == "__main__":
         log.warning("OWNER_ID ست نشده — هرکسی که چت رو استارت کنه می‌تونه از /login استفاده کنه.")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-      
+  
