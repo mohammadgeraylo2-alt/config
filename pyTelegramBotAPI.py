@@ -228,20 +228,25 @@ def start_login(phone: str):
 
     async def _start():
         client = await _make_client(f"login_{session_name}")
-        # ==== send_code(phone_number, pass_key=None, send_type='SMS') ====
-        result = await client.send_code(phone_number=phone)
-        # ====================================================================
-        return client, result
+        try:
+            # ==== send_code(phone_number, pass_key=None, send_type='SMS') ====
+            result = await client.send_code(phone_number=phone)
+            # ====================================================================
+            return result
+        finally:
+            # کلاینت رو همینجا می‌بندیم چون این event loop الان بسته می‌شه؛
+            # مرحله بعد (sign_in) با کلاینت تازه‌ی خودش تو یه loop جدید وصل می‌شه.
+            await _disconnect_client(client)
 
     try:
-        client, result = run_async(_start())
-        return True, client, result, private_pem, public_pem, "کد تایید ارسال شد"
+        result = run_async(_start())
+        return True, session_name, result, private_pem, public_pem, "کد تایید ارسال شد"
     except Exception as e:
         return False, None, None, None, None, f"{type(e).__name__}: {e}"
 
 
-def submit_login_code(client, phone: str, code: str, send_code_result, public_key_pem: str):
-    """مرحله دوم: فرستادن کد تایید + کلید عمومی، و گرفتن نتیجه لاگین."""
+def submit_login_code(session_name: str, phone: str, code: str, send_code_result, public_key_pem: str):
+    """مرحله دوم: با یه کلاینت تازه (تو event loop جدید) روی همون سشن، کد رو تایید می‌کنه."""
 
     phone_code_hash = extract_field(
         send_code_result, ["phone_code_hash", "code_hash", "hash", "pass_key"]
@@ -253,16 +258,19 @@ def submit_login_code(client, phone: str, code: str, send_code_result, public_ke
         )
 
     async def _submit():
-        # ==== sign_in(phone_code, phone_number, phone_code_hash, public_key) ====
-        result = await client.sign_in(
-            phone_code=code,
-            phone_number=phone,
-            phone_code_hash=phone_code_hash,
-            public_key=public_key_pem,
-        )
-        # ============================================================================
-        await _disconnect_client(client)
-        return result
+        client = await _make_client(f"login_{session_name}")
+        try:
+            # ==== sign_in(phone_code, phone_number, phone_code_hash, public_key) ====
+            result = await client.sign_in(
+                phone_code=code,
+                phone_number=phone,
+                phone_code_hash=phone_code_hash,
+                public_key=public_key_pem,
+            )
+            # ============================================================================
+            return result
+        finally:
+            await _disconnect_client(client)
 
     try:
         result = run_async(_submit())
@@ -297,7 +305,7 @@ def login_process_phone(message):
     phone = message.text.strip()
     status_msg = bot.reply_to(message, "در حال ارسال درخواست کد تایید...")
 
-    ok, client, send_code_result, private_pem, public_pem, detail = start_login(phone)
+    ok, session_name, send_code_result, private_pem, public_pem, detail = start_login(phone)
     if not ok:
         bot.edit_message_text(
             f"ارسال کد ناموفق بود: {detail}\nبا /debugrubpy امضای واقعی متدها رو چک کن.",
@@ -307,7 +315,7 @@ def login_process_phone(message):
         return
 
     pending_login_by_chat[chat_id] = {
-        "client": client,
+        "session_name": session_name,
         "phone": phone,
         "send_code_result": send_code_result,
         "private_pem": private_pem,
@@ -331,7 +339,7 @@ def login_process_code(message):
     status_msg = bot.reply_to(message, "در حال بررسی کد...")
 
     ok, auth, detail = submit_login_code(
-        pending["client"], pending["phone"], code,
+        pending["session_name"], pending["phone"], code,
         pending["send_code_result"], pending["public_pem"],
     )
     if not ok:
