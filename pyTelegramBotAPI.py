@@ -208,12 +208,15 @@ def submit_login_code(session_name: str, phone: str, code: str, send_code_result
             "با /debugsource ساختار دقیق خروجی sign_in رو بررسی کن."
         )
 
+    raw_repr = repr(send_code_result)
+    if len(raw_repr) > 2500:
+        raw_repr = raw_repr[:2500] + " ...(بریده شد)"
     return False, None, (
         "ورود با همه‌ی فرمت‌های شناخته‌شده‌ی کلید ناموفق بود:\n" + "\n".join(errors) +
         "\n\n— دیباگ (فقط همینجا نشون داده می‌شه، جایی لاگ نمی‌شه) —\n"
         f"phone_code_hash استخراج‌شده: {phone_code_hash!r}\n"
         f"طول کد وارد شده: {len(code)} کاراکتر\n"
-        f"خروجی خام کامل send_code:\n{send_code_result!r}"
+        f"خروجی خام کامل send_code:\n{raw_repr}"
     )
 
 
@@ -459,4 +462,4 @@ if __name__ == "__main__":
         log.warning("OWNER_ID ست نشده — هرکسی که چت رو استارت کنه می‌تونه از /login استفاده کنه.")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-                      
+  
