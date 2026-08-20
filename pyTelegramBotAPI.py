@@ -12,11 +12,17 @@
 سالم رو عضو یه کانال کنه یا نه. اگه آره رو زدی، آیدی/لینک کانال رو می‌فرستی
 و ربات با همون اکانت‌های سالم توش join می‌کنه.
 
+علاوه بر این، دکمه‌ی «ورود با شماره» هم اضافه شده: برای اکانت‌هایی که
+authشون رو نداری، با /login شماره + کد تایید رو می‌فرستی و ربات auth
+رو برات می‌سازه (خودت باید کد رو از پیامک/اپ روبیکای همون اکانت بخونی).
+
 نکته مهم: pyrubi مستندسازی ضعیفی داره (طبق تجربه قبلیت با این کتابخونه‌ها).
-اگه get_chats یا get_me یا join_channel متد درستی نبود، توی خط‌های
-CHECK_METHOD و JOIN_METHOD پایین باید با متد درست جایگزینش کنی.
-ساختار try/except طوری نوشته شده که فقط همون یه خط رو عوض کنی،
-بقیه کد دست‌نخورده می‌مونه.
+اگه get_chats یا get_me یا join_channel یا متدهای لاگین (send_code/
+sign_in) درست نبودن، توی خط‌های CHECK_METHOD و JOIN_METHOD و
+LOGIN_METHOD پایین باید با متد درست جایگزینشون کنی. برای پیدا کردن اسم
+درست متدهای لاگین از /debuglogin استفاده کن (مثل /debugjoin که برای
+join بود). ساختار try/except طوری نوشته شده که فقط همون یه خط رو عوض
+کنی، بقیه کد دست‌نخورده می‌مونه.
 """
 
 import os
@@ -45,6 +51,12 @@ waiting_for_channel = set()
 
 # آخرین لیست authهای سالم هر چت، برای استفاده در مرحله join
 healthy_auths_by_chat = {}
+
+# --- state مربوط به فلوی لاگین با شماره ---
+# منتظر شماره تلفن هستیم یا نه
+waiting_for_login_phone = set()
+# منتظر کد تایید هستیم یا نه؛ chat_id -> {"client": Client, "phone": str, "code_info": ...}
+pending_login_by_chat = {}
 
 
 def check_single_auth(auth: str) -> tuple[bool, str]:
@@ -170,6 +182,172 @@ def debugjoin_process(message):
             bot.send_message(status_msg.chat.id, chunk)
 
 
+def debug_login_methods(phone: str) -> str:
+    """
+    یه Client خام (بدون auth قبلی) می‌سازه و متدهایی که توی اسمشون
+    code / login / sign / auth هست رو لیست می‌کنه، تا اگه send_code یا
+    sign_in جواب نداد، بشه اسم درست متد رو پیدا کرد.
+    فقط برای دیباگ؛ چیزی رو واقعاً صدا نمی‌زنه چون خیلی از این متدها
+    آرگومان‌های متفاوت می‌خوان و اجراشون بدون کنترل می‌تونه کد تایید
+    اضافه بفرسته.
+    """
+    if Client is None:
+        return "کتابخونه pyrubi نصب نیست."
+
+    try:
+        client = Client(phone.strip())
+    except Exception as e:
+        return f"ساخت Client شکست خورد: {type(e).__name__}: {e}"
+
+    candidate_names = [
+        name for name in dir(client)
+        if any(key in name.lower() for key in ("code", "login", "sign", "auth"))
+    ]
+    if not candidate_names:
+        return "هیچ متد مرتبطی با code/login/sign/auth روی Client پیدا نشد."
+
+    return "متدهای پیدا‌شده (بدون اجرا، فقط اسم):\n" + "\n".join(f"• {n}" for n in candidate_names)
+
+
+@bot.message_handler(commands=["debuglogin"])
+def debuglogin_start(message):
+    msg = bot.reply_to(
+        message,
+        "شماره‌ای که می‌خوای باهاش لاگین کنی رو بفرست (مثلاً 989123456789)، "
+        "تا متدهای مرتبط با لاگین روی Client رو لیست کنم (بدون اجرا).",
+    )
+    bot.register_next_step_handler(msg, debuglogin_process)
+
+
+def debuglogin_process(message):
+    phone = message.text.strip()
+    bot.reply_to(message, debug_login_methods(phone))
+
+
+def start_login(phone: str):
+    """
+    مرحله اول لاگین: ساخت Client با شماره و درخواست ارسال کد تایید.
+    خروجی: (موفق بود یا نه, client یا None, پیام/جزئیات)
+    """
+    if Client is None:
+        return False, None, "کتابخونه pyrubi نصب نیست"
+
+    phone = phone.strip()
+    try:
+        client = Client(phone)
+
+        # ==== LOGIN_METHOD (ارسال کد): اگه send_code نبود عوضش کن ====
+        # گزینه‌های رایج توی کتابخونه‌های مشابه:
+        #   client.send_code(phone)
+        #   client.sendCode(phone)
+        # خروجی معمولاً یه pass_key/hash هست که برای مرحله بعد لازمه؛
+        # اینجا کلاینت رو نگه می‌داریم چون معمولاً این مقدار رو خودش
+        # داخل خودش ذخیره می‌کنه.
+        client.send_code(phone)
+        # ===============================================================
+
+        return True, client, "کد تایید ارسال شد"
+    except Exception as e:
+        return False, None, f"{type(e).__name__}: {e}"
+
+
+def submit_login_code(client, phone: str, code: str):
+    """
+    مرحله دوم لاگین: فرستادن کد تایید و گرفتن auth نهایی.
+    خروجی: (موفق بود یا نه, auth یا None, پیام/جزئیات)
+    """
+    try:
+        # ==== LOGIN_METHOD (تایید کد): اگه sign_in نبود عوضش کن ====
+        # گزینه‌های رایج:
+        #   client.sign_in(phone, code)
+        #   client.signIn(phone, code)
+        # اگه اکانت رمز دو مرحله‌ای (پسورد) داشته باشه، این متد ممکنه
+        # خطای مربوط به نیاز به پسورد بده؛ در اون صورت باید یه مرحله‌ی
+        # سوم (گرفتن پسورد از کاربر و صدا زدن متد تکمیل ورود با پسورد)
+        # اضافه کنیم.
+        client.sign_in(phone, code)
+        # ==============================================================
+
+        # ==== auth نهایی رو از کلاینت می‌گیریم؛ اسم اتریبیوت رو چک کن ====
+        auth = getattr(client, "auth", None)
+        if auth is None:
+            auth = getattr(client, "auth_key", None)
+        # ===================================================================
+
+        if auth:
+            return True, str(auth), "ورود موفق"
+        return True, None, "ورود موفق ولی auth رو خودکار پیدا نکردم — با /debuglogin چک کن اسم درست اتریبیوت چیه"
+    except Exception as e:
+        return False, None, f"{type(e).__name__}: {e}"
+
+
+@bot.message_handler(commands=["login"])
+def login_start(message):
+    waiting_for_login_phone.add(message.chat.id)
+    bot.reply_to(
+        message,
+        "شماره اکانتی که می‌خوای واردش بشی رو بفرست (با کد کشور، مثلاً 989123456789).\n"
+        "بعدش کد تاییدی که برای همون اکانت میاد رو از من می‌خوام.",
+    )
+
+
+@bot.message_handler(func=lambda m: m.chat.id in waiting_for_login_phone, content_types=["text"])
+def login_process_phone(message):
+    chat_id = message.chat.id
+    waiting_for_login_phone.discard(chat_id)
+
+    phone = message.text.strip()
+    status_msg = bot.reply_to(message, "در حال ارسال درخواست کد تایید...")
+
+    ok, client, detail = start_login(phone)
+    if not ok:
+        bot.edit_message_text(
+            f"ارسال کد ناموفق بود: {detail}\nاگه فکر می‌کنی اسم متد اشتباهه، از /debuglogin استفاده کن.",
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
+        )
+        return
+
+    pending_login_by_chat[chat_id] = {"client": client, "phone": phone}
+    bot.edit_message_text(
+        f"{detail}. حالا کدی که برای اکانت {phone} اومد رو بفرست.",
+        chat_id=status_msg.chat.id,
+        message_id=status_msg.message_id,
+    )
+
+
+@bot.message_handler(func=lambda m: m.chat.id in pending_login_by_chat, content_types=["text"])
+def login_process_code(message):
+    chat_id = message.chat.id
+    pending = pending_login_by_chat.pop(chat_id, None)
+    if pending is None:
+        return
+
+    code = message.text.strip()
+    status_msg = bot.reply_to(message, "در حال بررسی کد...")
+
+    ok, auth, detail = submit_login_code(pending["client"], pending["phone"], code)
+    if not ok:
+        bot.edit_message_text(
+            f"ورود ناموفق بود: {detail}",
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
+        )
+        return
+
+    if auth:
+        bot.edit_message_text(
+            f"{detail} ✅\n\nauth این اکانت:\n`{auth}`\n\n"
+            "این رو جایی امن نگه دار (توی پیام‌های دیگه پاکش کن). "
+            "می‌تونی همین auth رو با /check امتحان کنی و به لیست join اضافه کنی.",
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
+            parse_mode="Markdown",
+        )
+    else:
+        bot.edit_message_text(detail, chat_id=status_msg.chat.id, message_id=status_msg.message_id)
+
+
 def parse_auth_list(raw: str) -> list[str]:
     """
     ورودی رو به لیست auth تبدیل می‌کنه. هم فرمت خط‌به‌خط رو قبول می‌کنه
@@ -198,8 +376,10 @@ def start(message):
         "با /check شروع کن، بعد Authهات رو بفرست — هر کدوم توی یه خط جدا، "
         "یا به شکل آرایه مثل:\n"
         '["auth۱","auth۲","auth۳"]\n\n'
-        "اگه join کردن به کانال خطا داد، از /debugjoin برای پیدا کردن "
-        "متد درست pyrubi استفاده کن."
+        "اگه auth یه اکانت رو نداری، با /login شماره + کد تایید بده تا "
+        "auth رو برات بسازم.\n\n"
+        "اگه join کردن به کانال خطا داد، از /debugjoin و اگه لاگین خطا "
+        "داد از /debuglogin برای پیدا کردن متد درست pyrubi استفاده کن."
     )
 
 
