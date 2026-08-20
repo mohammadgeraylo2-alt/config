@@ -244,6 +244,63 @@ def debug_rubpy_signatures() -> str:
     return "امضای متدهای مرتبط با لاگین:\n" + "\n".join(lines)
 
 
+@bot.message_handler(commands=["debugcrypto"])
+def debugcrypto_cmd(message):
+    """
+    به‌جای حدس زدن فرمت RSA، خودِ پکیج rubpy نصب‌شده رو می‌گرده دنبال
+    ماژول‌ها/توابعی که به RSA یا ساخت کلید مربوطن و سورسشون رو چاپ می‌کنه.
+    اگه rubpy خودش تابع ساخت کلید داره، دقیق‌ترین منبع همینه، نه حدس ما.
+    """
+    if not _authorized(message.chat.id):
+        return
+    try:
+        import rubpy
+        import pkgutil
+        import importlib
+    except ImportError:
+        bot.reply_to(message, "کتابخونه rubpy نصب نیست.")
+        return
+
+    hits = []
+    try:
+        for finder, name, ispkg in pkgutil.walk_packages(rubpy.__path__, prefix="rubpy."):
+            lname = name.lower()
+            if not any(k in lname for k in ("crypto", "rsa", "key")):
+                continue
+            try:
+                mod = importlib.import_module(name)
+            except Exception:
+                continue
+            for attr_name in dir(mod):
+                if attr_name.startswith("_"):
+                    continue
+                lattr = attr_name.lower()
+                if any(k in lattr for k in ("rsa", "generate_key", "public_key", "publickey", "key_pair", "keypair")):
+                    attr = getattr(mod, attr_name)
+                    if callable(attr):
+                        try:
+                            src = inspect.getsource(attr)
+                        except Exception:
+                            continue
+                        hits.append(f"--- {name}.{attr_name} ---\n{src}")
+    except Exception as e:
+        bot.reply_to(message, f"گشتن توی rubpy شکست خورد: {type(e).__name__}: {e}")
+        return
+
+    if not hits:
+        bot.reply_to(
+            message,
+            "هیچ تابع ساخت‌کلید RSA داخلی توی rubpy پیدا نشد — یعنی احتمالاً "
+            "واقعاً باید خودمون بسازیمش و فرمتش رو با آزمون‌وخطا پیدا کنیم.",
+        )
+        return
+
+    full = "\n\n".join(hits)
+    max_len = 3500
+    for i in range(0, len(full), max_len):
+        bot.send_message(message.chat.id, full[i:i + max_len])
+
+
 @bot.message_handler(commands=["debugrubpy"])
 def debugrubpy_cmd(message):
     if not _authorized(message.chat.id):
@@ -400,4 +457,4 @@ if __name__ == "__main__":
         log.warning("OWNER_ID ست نشده — هرکسی که چت رو استارت کنه می‌تونه از /login استفاده کنه.")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-  
+      
