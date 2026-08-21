@@ -1,32 +1,17 @@
 """
-ربات تلگرامی لاگین شخصی روبیکا (نسخه rubpy) — single-account
---------------------------------------------------------------
-این نسخه عمداً محدود شده به «فقط یک اکانت، فقط لاگین با شماره خودت»:
-  - هیچ ورودی برای لیست auth وجود ندارد.
-  - هیچ حلقه‌ی چک گروهی / join گروهی وجود ندارد.
-  - در هر لحظه فقط یک فرآیند لاگین (برای یک شماره) در جریان است.
-  - هیچ auth/session ای غیر از همانی که خودِ کاربر همین الان با کد
-    تایید خودش دریافت می‌کند، ساخته یا ذخیره نمی‌شود.
-  - کد تایید و مقدار auth هرگز در لاگ سرور چاپ نمی‌شوند؛ فقط در پیام
-    خصوصی تلگرام به همان کاربر برگردانده می‌شوند.
-
-نیازمندی‌ها (requirements.txt):
-    pyTelegramBotAPI
-    rubpy
-    pycryptodome
-
-متغیرهای محیطی:
-    BOT_TOKEN   (اجباری) توکن ربات تلگرام
-    OWNER_ID    (اختیاری) اگر ست بشه، فقط همین chat_id اجازه‌ی استفاده از
-                /login رو داره — برای اینکه ربات فقط ابزار شخصی خودت بمونه.
+ربات تلگرامی چک اکانت روبیکا + لاگین با شماره (rubpy)
+requirements.txt: pyTelegramBotAPI, rubpy
 """
 
 import os
 import re
+import json
 import asyncio
 import inspect
 import logging
+import base64
 import telebot
+from telebot import types
 
 try:
     from rubpy import Client
@@ -36,192 +21,120 @@ except ImportError:
 try:
     from Crypto.PublicKey import RSA
     from Crypto.Util.asn1 import DerSequence
-    import base64
 except ImportError:
     RSA = None
     DerSequence = None
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("personal-login-rubpy")
+log = logging.getLogger("auth-checker-rubpy")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
-OWNER_ID = os.environ.get("OWNER_ID")  # اختیاری: اگر ست بشه، فقط این chat_id اجازه داره
 bot = telebot.TeleBot(BOT_TOKEN)
 
 SESSIONS_DIR = "login_sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# فقط یک فرآیند لاگین در هر لحظه، برای هر chat — نه لیست، نه دیکشنری از چند اکانت
-_pending_login = {}  # chat_id -> {"session_name", "phone", "send_code_result", "public_key_candidates"}
-
-
-def _authorized(chat_id) -> bool:
-    if not OWNER_ID:
-        return True
-    return str(chat_id) == str(OWNER_ID)
+waiting_for_auths = set()
+waiting_for_channel = set()
+healthy_auths_by_chat = {}
+waiting_for_login_phone = set()
+pending_login_by_chat = {}  # chat_id -> {session_name, phone, send_code_result, public_pem}
 
 
 def run_async(coro):
     return asyncio.run(coro)
 
 
-def strip_pem_headers(pem: str) -> str:
-    lines = [
-        line.strip() for line in pem.strip().splitlines()
-        if line.strip() and not line.startswith("-----")
-    ]
-    return "".join(lines)
+def build_kwargs(func, concept_values: dict) -> dict:
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        return {}
+    kwargs = {}
+    for name in sig.parameters:
+        if name in ("self", "args", "kwargs"):
+            continue
+        for concept, value in concept_values.items():
+            if concept in name.lower():
+                kwargs[name] = value
+                break
+    return kwargs
 
 
-def generate_rsa_keypair():
-    """
-    جفت‌کلید RSA (۱۰۲۴ بیتی) برای همین یک لاگین می‌سازه، و چون فرمت دقیقِ
-    public_key مورد انتظار سرور روبیکا مستند نیست، چند نامزد رایج رو
-    آماده می‌کنه تا submit_login_code به‌ترتیب امتحانشون کنه:
-      - "pkcs1_der_b64": DER خامِ PKCS#1 (SEQUENCE{n, e}) بدون هدر — حدس قبلی.
-      - "spki_der_b64": DER استاندارد X.509 SubjectPublicKeyInfo بدون هدر.
-      - "pem": همون PEM استاندارد کامل (با BEGIN/END).
-    """
+def generate_rsa_keypair() -> tuple[str, str]:
+    """کلید عمومی به فرمت خام PKCS#1 base64 (بدون هدر PEM) برمی‌گردونه — فرمتی که روبیکا می‌خواد."""
     if RSA is None:
         raise RuntimeError("pycryptodome نصب نیست")
     key = RSA.generate(1024)
     private_pem = key.export_key().decode()
     pub = key.publickey()
-
-    der_pkcs1 = DerSequence([pub.n, pub.e]).encode()
-    pkcs1_der_b64 = base64.b64encode(der_pkcs1).decode()
-
-    spki_der = pub.export_key(format="DER")  # PKCS#8/X.509 SubjectPublicKeyInfo
-    spki_der_b64 = base64.b64encode(spki_der).decode()
-
-    pem = pub.export_key().decode()
-
-    candidates = [
-        ("pkcs1_der_b64", pkcs1_der_b64),
-        ("spki_der_b64", spki_der_b64),
-        ("pem", pem),
-    ]
-    return private_pem, candidates
+    der = DerSequence([pub.n, pub.e]).encode()
+    return private_pem, base64.b64encode(der).decode()
 
 
 def extract_field(obj, candidates: list[str]):
     for name in candidates:
         if isinstance(obj, dict) and name in obj:
             return obj[name]
-        if hasattr(obj, name):
+        if hasattr(obj, name) and getattr(obj, name) is not None:
             return getattr(obj, name)
     return None
+
+
+def dump_fields(obj) -> str:
+    """همه‌ی فیلدهای واقعی یه شیء رو برای دیباگ چاپ می‌کنه."""
+    if isinstance(obj, dict):
+        return repr(obj)
+    d = getattr(obj, "__dict__", None)
+    if d:
+        return repr(d)
+    return repr(obj)
 
 
 async def _make_client(session_name: str):
     if Client is None:
         raise RuntimeError("کتابخونه rubpy نصب نیست")
     client = Client(name=os.path.join(SESSIONS_DIR, session_name))
-    connect_fn = getattr(client, "connect", None)
-    if callable(connect_fn):
-        await connect_fn()
+    if callable(getattr(client, "connect", None)):
+        await client.connect()
     return client
 
 
 async def _disconnect_client(client):
-    disconnect_fn = getattr(client, "disconnect", None)
-    if callable(disconnect_fn):
+    if callable(getattr(client, "disconnect", None)):
         try:
-            await disconnect_fn()
+            await client.disconnect()
         except Exception:
             pass
 
 
-def start_login(phone: str):
-    """مرحله اول: ساخت کلید RSA و ارسال کد تایید برای همین یک شماره."""
+def check_single_auth(auth: str, private_key: str = None) -> tuple[bool, str]:
+    auth = auth.strip()
+    if not auth:
+        return False, "خالی بود"
     if Client is None:
-        return False, None, None, None, None, "کتابخونه rubpy نصب نیست"
+        return False, "کتابخونه rubpy نصب نیست"
 
-    phone = phone.strip()
-    session_name = re.sub(r"[^0-9]", "", phone) or "unknown"
-
-    try:
-        private_pem, public_key_candidates = generate_rsa_keypair()
-    except Exception as e:
-        return False, None, None, None, None, f"ساخت کلید RSA شکست خورد: {type(e).__name__}: {e}"
-
-    async def _start():
-        client = await _make_client(f"login_{session_name}")
+    async def _check():
+        client = Client(name="temp_check_session", auth=auth, private_key=private_key)
+        if callable(getattr(client, "connect", None)):
+            await client.connect()
         try:
-            result = await client.send_code(phone_number=phone)
-            return result
+            fn = getattr(client, "get_me", None) or getattr(client, "get_chats", None)
+            if fn is None:
+                raise AttributeError("نه get_me نه get_chats پیدا شد")
+            return await fn()
         finally:
             await _disconnect_client(client)
 
     try:
-        result = run_async(_start())
-        # لاگ فقط وضعیت رو ثبت می‌کنه، نه محتوای خام (که ممکنه هش/کد داشته باشه)
-        log.info("send_code برای شماره ختم‌شده به %s با موفقیت اجرا شد", phone[-4:])
-        return True, session_name, result, private_pem, public_key_candidates, "کد تایید ارسال شد"
+        result = run_async(_check())
+        return (True, "سالم") if result is not None else (False, "پاسخ خالی از سرور")
     except Exception as e:
-        return False, None, None, None, None, f"{type(e).__name__}: {e}"
-
-
-def submit_login_code(session_name: str, phone: str, code: str, send_code_result, public_key_candidates):
-    """
-    مرحله دوم: تایید کد برای همون یک شماره.
-    چون فرمت public_key مستند نیست، به‌ترتیب چند فرمت رو با همون یک کد
-    امتحان می‌کنه تا یکی جواب بده (کد فقط وقتی مصرف می‌شه که سرور واقعاً
-    قبولش کنه؛ رد شدن با INVALID_INPUT کد رو باطل نمی‌کنه).
-    """
-    phone_code_hash = extract_field(
-        send_code_result, ["phone_code_hash", "code_hash", "hash"]
-    )
-    if not phone_code_hash:
-        return False, None, (
-            "phone_code_hash رو از خروجی send_code پیدا نکردم.\n"
-            "با /debugsource سورس واقعی send_code/sign_in رو ببین (کد/سشن چاپ نمی‌شه)."
-        )
-
-    async def _attempt(public_key_value):
-        client = await _make_client(f"login_{session_name}")
-        try:
-            return await client.sign_in(
-                phone_code=code,
-                phone_number=phone,
-                phone_code_hash=phone_code_hash,
-                public_key=public_key_value,
-            )
-        finally:
-            await _disconnect_client(client)
-
-    errors = []
-    for fmt_name, public_key_value in public_key_candidates:
-        try:
-            result = run_async(_attempt(public_key_value))
-        except Exception as e:
-            log.warning("sign_in با فرمت %s شکست خورد: %s", fmt_name, type(e).__name__)
-            errors.append(f"{fmt_name}: {type(e).__name__}: {e}")
-            continue
-
-        auth_val = extract_field(result, ["auth", "auth_key", "key"])
-        log.info("sign_in با فرمت %s موفق بود؛ auth %s.", fmt_name, "پیدا شد" if auth_val else "پیدا نشد")
-        if auth_val:
-            return True, str(auth_val), f"ورود موفق (فرمت کلید: {fmt_name})"
-        return True, None, (
-            f"ورود با فرمت {fmt_name} ظاهراً موفق بود ولی فیلد auth رو خودکار پیدا نکردم.\n"
-            "با /debugsource ساختار دقیق خروجی sign_in رو بررسی کن."
-        )
-
-    raw_repr = repr(send_code_result)
-    if len(raw_repr) > 2500:
-        raw_repr = raw_repr[:2500] + " ...(بریده شد)"
-    return False, None, (
-        "ورود با همه‌ی فرمت‌های شناخته‌شده‌ی کلید ناموفق بود:\n" + "\n".join(errors) +
-        "\n\n— دیباگ (فقط همینجا نشون داده می‌شه، جایی لاگ نمی‌شه) —\n"
-        f"phone_code_hash استخراج‌شده: {phone_code_hash!r}\n"
-        f"طول کد وارد شده: {len(code)} کاراکتر\n"
-        f"خروجی خام کامل send_code:\n{raw_repr}"
-    )
+        return False, f"{type(e).__name__}: {e}"
 
 
 def debug_rubpy_signatures() -> str:
-    """امضای متدهای لاگین رو از کتابخونه‌ی نصب‌شده چاپ می‌کنه (بدون داده‌ی حساس)."""
     if Client is None:
         return "کتابخونه rubpy نصب نیست."
     try:
@@ -229,95 +142,31 @@ def debug_rubpy_signatures() -> str:
     except Exception as e:
         return f"ساخت Client شکست خورد: {type(e).__name__}: {e}"
 
-    interesting = [n for n in dir(client) if any(k in n.lower() for k in
-                   ("send_code", "sign_in", "login", "connect", "get_me", "key", "rsa"))]
+    keys = ("send_code", "sign_in", "login", "code", "connect", "get_me", "get_chats", "key", "rsa", "crypto")
     lines = []
-    for name in interesting:
+    for name in [n for n in dir(client) if any(k in n.lower() for k in keys)]:
         try:
             attr = getattr(client, name)
         except Exception as e:
-            lines.append(f"• {name}: خطا در دسترسی ({type(e).__name__})")
+            lines.append(f"• {name}: خطا ({type(e).__name__})")
             continue
         if callable(attr):
             try:
-                sig = inspect.signature(attr)
-                lines.append(f"• {name}{sig}  [متد]")
+                lines.append(f"• {name}{inspect.signature(attr)}  [متد]")
             except (TypeError, ValueError):
                 lines.append(f"• {name}(...)  [متد]")
         else:
             lines.append(f"• {name} = {attr!r}  [اتریبیوت]")
-    return "امضای متدهای مرتبط با لاگین:\n" + "\n".join(lines)
-
-
-@bot.message_handler(commands=["debugcrypto"])
-def debugcrypto_cmd(message):
-    """
-    به‌جای حدس زدن فرمت RSA، خودِ پکیج rubpy نصب‌شده رو می‌گرده دنبال
-    ماژول‌ها/توابعی که به RSA یا ساخت کلید مربوطن و سورسشون رو چاپ می‌کنه.
-    اگه rubpy خودش تابع ساخت کلید داره، دقیق‌ترین منبع همینه، نه حدس ما.
-    """
-    if not _authorized(message.chat.id):
-        return
-    try:
-        import rubpy
-        import pkgutil
-        import importlib
-    except ImportError:
-        bot.reply_to(message, "کتابخونه rubpy نصب نیست.")
-        return
-
-    hits = []
-    try:
-        for finder, name, ispkg in pkgutil.walk_packages(rubpy.__path__, prefix="rubpy."):
-            lname = name.lower()
-            if not any(k in lname for k in ("crypto", "rsa", "key")):
-                continue
-            try:
-                mod = importlib.import_module(name)
-            except Exception:
-                continue
-            for attr_name in dir(mod):
-                if attr_name.startswith("_"):
-                    continue
-                lattr = attr_name.lower()
-                if any(k in lattr for k in ("rsa", "generate_key", "public_key", "publickey", "key_pair", "keypair")):
-                    attr = getattr(mod, attr_name)
-                    if callable(attr):
-                        try:
-                            src = inspect.getsource(attr)
-                        except Exception:
-                            continue
-                        hits.append(f"--- {name}.{attr_name} ---\n{src}")
-    except Exception as e:
-        bot.reply_to(message, f"گشتن توی rubpy شکست خورد: {type(e).__name__}: {e}")
-        return
-
-    if not hits:
-        bot.reply_to(
-            message,
-            "هیچ تابع ساخت‌کلید RSA داخلی توی rubpy پیدا نشد — یعنی احتمالاً "
-            "واقعاً باید خودمون بسازیمش و فرمتش رو با آزمون‌وخطا پیدا کنیم.",
-        )
-        return
-
-    full = "\n\n".join(hits)
-    max_len = 3500
-    for i in range(0, len(full), max_len):
-        bot.send_message(message.chat.id, full[i:i + max_len])
+    return "امضای متدها/اتریبیوت‌ها:\n" + "\n".join(lines)
 
 
 @bot.message_handler(commands=["debugrubpy"])
 def debugrubpy_cmd(message):
-    if not _authorized(message.chat.id):
-        return
     bot.reply_to(message, debug_rubpy_signatures())
 
 
 @bot.message_handler(commands=["debugsource"])
 def debugsource_cmd(message):
-    """سورس واقعی send_code/sign_in رو چاپ می‌کنه (فقط کد کتابخونه، نه داده‌ی کاربر)."""
-    if not _authorized(message.chat.id):
-        return
     if Client is None:
         bot.reply_to(message, "کتابخونه rubpy نصب نیست.")
         return
@@ -328,103 +177,118 @@ def debugsource_cmd(message):
         return
 
     report = []
-    for name in ("send_code", "sign_in", "builder"):
+    for name in ("send_code", "sign_in"):
         fn = getattr(client, name, None)
-        if fn is None:
-            report.append(f"--- {name}: پیدا نشد ---")
-            continue
         try:
-            src = inspect.getsource(fn)
+            src = inspect.getsource(fn) if fn else f"{name}: پیدا نشد"
         except Exception as e:
-            src = f"(سورس در دسترس نبود: {type(e).__name__}: {e})"
+            src = f"(سورس در دسترس نبود: {e})"
         report.append(f"--- {name} ---\n{src}")
 
     full = "\n\n".join(report)
-    max_len = 3500
-    for i in range(0, len(full), max_len):
-        bot.send_message(message.chat.id, full[i:i + max_len])
+    for i in range(0, len(full), 3500):
+        bot.send_message(message.chat.id, full[i:i + 3500])
 
 
-@bot.message_handler(commands=["start", "help"])
-def start(message):
-    bot.reply_to(
-        message,
-        "سلام 👋\n"
-        "این ربات فقط برای لاگین به یک اکانت شخصی روبیکا (با شماره و کد خودت) است.\n"
-        "با /login شروع کن.\n\n"
-        "اگه خطا خوردی: /debugrubpy یا /debugsource (این دو فقط ساختار "
-        "کتابخونه رو نشون می‌دن، هیچ داده‌ی حساسی چاپ نمی‌کنن).",
-    )
+def start_login(phone: str):
+    if Client is None:
+        return False, None, None, None, None, "کتابخونه rubpy نصب نیست"
+
+    phone = phone.strip()
+    session_name = re.sub(r"[^0-9]", "", phone) or "unknown"
+
+    try:
+        private_pem, public_pem = generate_rsa_keypair()
+    except Exception as e:
+        return False, None, None, None, None, f"ساخت کلید RSA شکست خورد: {e}"
+
+    async def _start():
+        client = await _make_client(f"login_{session_name}")
+        try:
+            return await client.send_code(phone_number=phone)
+        finally:
+            await _disconnect_client(client)
+
+    try:
+        result = run_async(_start())
+        return True, session_name, result, private_pem, public_pem, "کد تایید ارسال شد"
+    except Exception as e:
+        return False, None, None, None, None, f"{type(e).__name__}: {e}"
+
+
+def submit_login_code(session_name: str, phone: str, code: str, send_code_result, public_key_pem: str):
+    phone_code_hash = extract_field(send_code_result, ["phone_code_hash", "code_hash", "hash"])
+    if not phone_code_hash:
+        return False, None, (
+            f"phone_code_hash پیدا نشد. فیلدهای واقعی send_code:\n{dump_fields(send_code_result)}"
+        )
+
+    async def _submit():
+        client = await _make_client(f"login_{session_name}")
+        try:
+            return await client.sign_in(
+                phone_code=code,
+                phone_number=phone,
+                phone_code_hash=phone_code_hash,
+                public_key=public_key_pem,
+            )
+        finally:
+            await _disconnect_client(client)
+
+    try:
+        result = run_async(_submit())
+        auth_val = extract_field(result, ["auth", "auth_key", "key"])
+        if auth_val:
+            return True, str(auth_val), "ورود موفق"
+        return True, None, f"موفق بود ولی auth پیدا نشد. فیلدهای واقعی:\n{dump_fields(result)}"
+    except Exception as e:
+        return False, None, (
+            f"{type(e).__name__}: {e}\n\n"
+            f"phone_code_hash: {phone_code_hash!r}\n"
+            f"فیلدهای send_code: {dump_fields(send_code_result)}\n"
+            f"طول public_key: {len(public_key_pem)}"
+        )
 
 
 @bot.message_handler(commands=["login"])
 def login_start(message):
-    chat_id = message.chat.id
-    if not _authorized(chat_id):
-        bot.reply_to(message, "این ربات فقط برای مالک آن قابل استفاده است.")
-        return
-    if chat_id in _pending_login:
-        bot.reply_to(message, "یه فرآیند لاگین قبلاً در جریانه. اول کدش رو بفرست یا /cancel بزن.")
-        return
-
-    _pending_login[chat_id] = {"stage": "await_phone"}
+    waiting_for_login_phone.add(message.chat.id)
     bot.reply_to(
         message,
-        "شماره اکانت خودت رو با کد کشور بفرست (مثلاً 989123456789).\n"
-        "این فقط برای لاگین به همین یک اکانتِ خودت استفاده می‌شه.",
+        "شماره اکانت رو با کد کشور بفرست (مثلاً 989123456789).\n"
+        "اگه خطا خوردی، /debugrubpy یا /debugsource رو بزن.",
     )
 
 
-@bot.message_handler(commands=["cancel"])
-def login_cancel(message):
-    chat_id = message.chat.id
-    if _pending_login.pop(chat_id, None) is not None:
-        bot.reply_to(message, "فرآیند لاگین لغو شد.")
-    else:
-        bot.reply_to(message, "چیزی برای لغو کردن نیست.")
-
-
-@bot.message_handler(
-    func=lambda m: _pending_login.get(m.chat.id, {}).get("stage") == "await_phone",
-    content_types=["text"],
-)
+@bot.message_handler(func=lambda m: m.chat.id in waiting_for_login_phone, content_types=["text"])
 def login_process_phone(message):
     chat_id = message.chat.id
+    waiting_for_login_phone.discard(chat_id)
+
     phone = message.text.strip()
     status_msg = bot.reply_to(message, "در حال ارسال درخواست کد تایید...")
 
-    ok, session_name, send_code_result, private_pem, public_key_candidates, detail = start_login(phone)
+    ok, session_name, send_code_result, private_pem, public_pem, detail = start_login(phone)
     if not ok:
-        _pending_login.pop(chat_id, None)
-        bot.edit_message_text(
-            f"ارسال کد ناموفق بود: {detail}",
-            chat_id=status_msg.chat.id,
-            message_id=status_msg.message_id,
-        )
+        bot.edit_message_text(f"ارسال کد ناموفق بود: {detail}", chat_id=status_msg.chat.id, message_id=status_msg.message_id)
         return
 
-    _pending_login[chat_id] = {
-        "stage": "await_code",
+    pending_login_by_chat[chat_id] = {
         "session_name": session_name,
         "phone": phone,
         "send_code_result": send_code_result,
-        "public_key_candidates": public_key_candidates,
+        "public_pem": public_pem,
     }
     bot.edit_message_text(
-        f"{detail}. حالا کدی که برای همین اکانت اومد رو بفرست.\n"
-        "(اگه کار نکرد، /cancel بزن و دوباره امتحان کن.)",
-        chat_id=status_msg.chat.id,
-        message_id=status_msg.message_id,
+        f"{detail}. حالا کدی که برای اکانت {phone} اومد رو بفرست.",
+        chat_id=status_msg.chat.id, message_id=status_msg.message_id,
     )
 
 
-@bot.message_handler(
-    func=lambda m: _pending_login.get(m.chat.id, {}).get("stage") == "await_code",
-    content_types=["text"],
-)
+@bot.message_handler(func=lambda m: m.chat.id in pending_login_by_chat, content_types=["text"])
 def login_process_code(message):
     chat_id = message.chat.id
-    pending = _pending_login.pop(chat_id, None)
+    pending = pending_login_by_chat.pop(chat_id, None)
     if pending is None:
         return
 
@@ -433,33 +297,152 @@ def login_process_code(message):
 
     ok, auth, detail = submit_login_code(
         pending["session_name"], pending["phone"], code,
-        pending["send_code_result"], pending["public_key_candidates"],
+        pending["send_code_result"], pending["public_pem"],
     )
     if not ok:
-        bot.edit_message_text(
-            f"ورود ناموفق بود: {detail}",
-            chat_id=status_msg.chat.id,
-            message_id=status_msg.message_id,
-        )
+        bot.edit_message_text(f"ورود ناموفق بود: {detail}", chat_id=status_msg.chat.id, message_id=status_msg.message_id)
         return
 
     if auth:
         bot.edit_message_text(
-            f"{detail} ✅\n\nauth اکانت شما:\n`{auth}`\n\n"
-            "این پیام را در جای امنی ذخیره کن و بعد از کپی، همین پیام را از چت پاک کن.",
-            chat_id=status_msg.chat.id,
-            message_id=status_msg.message_id,
-            parse_mode="Markdown",
+            f"{detail} ✅\n\nauth این اکانت:\n`{auth}`\n\nاین رو جایی امن نگه دار.",
+            chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="Markdown",
         )
     else:
         bot.edit_message_text(detail, chat_id=status_msg.chat.id, message_id=status_msg.message_id)
 
 
+def parse_auth_list(raw: str) -> list[str]:
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            data = json.loads(raw)
+            return [str(item).strip() for item in data if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+    cleaned = raw.replace("[", "").replace("]", "")
+    parts = re.split(r"[\n,]+", cleaned)
+    return [p.strip().strip('"').strip("'") for p in parts if p.strip().strip('"').strip("'")]
+
+
+@bot.message_handler(commands=["start", "help"])
+def start(message):
+    bot.reply_to(
+        message,
+        "سلام 👋\n/check برای بررسی auth، /login برای ساخت auth جدید با شماره.\n"
+        "برای دیباگ: /debugrubpy یا /debugsource",
+    )
+
+
+@bot.message_handler(commands=["check"])
+def ask_auths(message):
+    waiting_for_auths.add(message.chat.id)
+    bot.reply_to(message, "باشه، حالا Authهات رو بفرست (هر کدوم توی یه خط جدا).")
+
+
+@bot.message_handler(func=lambda m: m.chat.id in waiting_for_auths, content_types=["text"])
+def process_auths(message):
+    waiting_for_auths.discard(message.chat.id)
+
+    auths = parse_auth_list(message.text)
+    if not auths:
+        bot.reply_to(message, "چیزی دریافت نشد. دوباره /check رو بزن.")
+        return
+
+    status_msg = bot.reply_to(message, f"در حال بررسی {len(auths)} اکانت...")
+
+    healthy, healthy_auths, lines = 0, [], []
+    for i, auth in enumerate(auths, start=1):
+        ok, detail = check_single_auth(auth)
+        if ok:
+            healthy += 1
+            healthy_auths.append(auth)
+            lines.append(f"✅ اکانت {i}: سالم")
+        else:
+            lines.append(f"❌ اکانت {i}: مشکل دارد ({detail})")
+
+    summary = "نتیجه بررسی:\n\n" + "\n".join(lines) + f"\n\n📊 جمع‌بندی: {healthy} از {len(auths)} سالم."
+    bot.edit_message_text(summary, chat_id=status_msg.chat.id, message_id=status_msg.message_id)
+
+    if healthy_auths:
+        healthy_auths_by_chat[message.chat.id] = healthy_auths
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("بله، اد کن ✅", callback_data="join_yes"),
+            types.InlineKeyboardButton("نه", callback_data="join_no"),
+        )
+        bot.send_message(message.chat.id, f"می‌خوای {healthy} اکانت سالم رو عضو یه کانال کنم؟", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ("join_yes", "join_no"))
+def handle_join_choice(call):
+    bot.answer_callback_query(call.id)
+    chat_id = call.message.chat.id
+
+    if call.data == "join_no":
+        healthy_auths_by_chat.pop(chat_id, None)
+        bot.edit_message_text("باشه، کاری انجام نشد.", chat_id=chat_id, message_id=call.message.message_id)
+        return
+
+    if chat_id not in healthy_auths_by_chat:
+        bot.send_message(chat_id, "لیست اکانت سالمی پیدا نشد. دوباره /check رو بزن.")
+        return
+
+    waiting_for_channel.add(chat_id)
+    bot.edit_message_text("آیدی یا لینک کانال روبیکا رو بفرست.", chat_id=chat_id, message_id=call.message.message_id)
+
+
+def join_channel_with_auth(auth: str, channel_id: str) -> tuple[bool, str]:
+    async def _join():
+        client = Client(name="temp_join_session", auth=auth.strip())
+        if callable(getattr(client, "connect", None)):
+            await client.connect()
+        try:
+            join_fn = next(
+                (getattr(client, n) for n in dir(client) if "join" in n.lower() and callable(getattr(client, n))),
+                None,
+            )
+            if join_fn is None:
+                raise AttributeError("هیچ متد join پیدا نشد")
+            kwargs = build_kwargs(join_fn, {"channel": channel_id, "guid": channel_id, "link": channel_id})
+            await (join_fn(**kwargs) if kwargs else join_fn(channel_id))
+        finally:
+            await _disconnect_client(client)
+
+    try:
+        run_async(_join())
+        return True, "عضو شد"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+@bot.message_handler(func=lambda m: m.chat.id in waiting_for_channel, content_types=["text"])
+def process_channel_join(message):
+    chat_id = message.chat.id
+    waiting_for_channel.discard(chat_id)
+
+    channel_id = message.text.strip()
+    healthy_auths = healthy_auths_by_chat.pop(chat_id, [])
+    if not healthy_auths:
+        bot.reply_to(message, "لیست اکانت سالمی پیدا نشد. دوباره /check رو بزن.")
+        return
+
+    status_msg = bot.reply_to(message, f"در حال اد کردن {len(healthy_auths)} اکانت به کانال...")
+
+    joined, lines = 0, []
+    for i, auth in enumerate(healthy_auths, start=1):
+        ok, detail = join_channel_with_auth(auth, channel_id)
+        if ok:
+            joined += 1
+        lines.append(f"{'✅' if ok else '❌'} اکانت {i}: {detail}")
+
+    summary = "نتیجه اد کردن:\n\n" + "\n".join(lines) + f"\n\n📊 {joined} از {len(healthy_auths)} موفق."
+    bot.edit_message_text(summary, chat_id=status_msg.chat.id, message_id=status_msg.message_id)
+
+
 if __name__ == "__main__":
     if BOT_TOKEN == "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        log.warning("BOT_TOKEN تنظیم نشده! متغیر محیطی BOT_TOKEN رو ست کن.")
-    if not OWNER_ID:
-        log.warning("OWNER_ID ست نشده — هرکسی که چت رو استارت کنه می‌تونه از /login استفاده کنه.")
+        log.warning("BOT_TOKEN تنظیم نشده!")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
   
