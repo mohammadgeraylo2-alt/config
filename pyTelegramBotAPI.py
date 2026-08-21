@@ -190,6 +190,41 @@ def debugsource_cmd(message):
         bot.send_message(message.chat.id, full[i:i + 3500])
 
 
+@bot.message_handler(commands=["debugcrypto"])
+def debugcrypto_cmd(message):
+    """کل پکیج rubpy رو برای هر چیزی مرتبط با تولید کلید/رمزنگاری می‌گرده."""
+    try:
+        import rubpy
+        import pkgutil
+        import importlib
+    except ImportError as e:
+        bot.reply_to(message, f"ایمپورت rubpy شکست خورد: {e}")
+        return
+
+    lines = []
+    seen = set()
+    for finder, name, ispkg in pkgutil.walk_packages(rubpy.__path__, prefix="rubpy."):
+        try:
+            mod = importlib.import_module(name)
+        except Exception:
+            continue
+        for attr_name in dir(mod):
+            if attr_name.startswith("_") or attr_name in seen:
+                continue
+            lname = attr_name.lower()
+            if any(k in lname for k in ("rsa", "keypair", "generate_key", "genkey", "keygen", "public_key", "crypto")):
+                seen.add(attr_name)
+                lines.append(f"{name}.{attr_name}")
+
+    if not lines:
+        bot.reply_to(message, "هیچ چیز مرتبطی تو کل پکیج rubpy پیدا نشد.")
+        return
+
+    full = "موارد پیدا‌شده:\n" + "\n".join(lines)
+    for i in range(0, len(full), 3500):
+        bot.send_message(message.chat.id, full[i:i + 3500])
+
+
 def start_login(phone: str):
     if Client is None:
         return False, None, None, None, None, "کتابخونه rubpy نصب نیست"
@@ -445,4 +480,3 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده!")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-    
