@@ -113,7 +113,7 @@ def check_single_auth(auth: str) -> tuple[bool, str]:
         return False, f"auth باید ۳۲ کاراکتر باشه (الان {len(auth)} کاراکتره) — احتمالاً auth رمزگشایی‌نشده رو فرستادی"
 
     async def _check():
-        client = Client(name="temp_check_session", auth=auth)
+        client = Client(name=f"temp_check_{abs(hash(auth))}", auth=auth)
         if callable(getattr(client, "connect", None)):
             await client.connect()
         try:
@@ -266,6 +266,22 @@ def debugconnect_cmd(message):
         except Exception as e:
             src = f"(سورس در دسترس نبود: {e})"
         report.append(f"--- {name} ---\n{src}")
+
+    conn = getattr(client, "connection", None)
+    if conn is None:
+        try:
+            from rubpy.network import Network
+            conn = Network(client=client)
+        except Exception as e:
+            conn = None
+            report.append(f"--- Network: ساخت شکست خورد: {e} ---")
+    if conn is not None:
+        send_fn = getattr(conn, "send", None)
+        try:
+            src = inspect.getsource(send_fn) if send_fn else "send: پیدا نشد"
+        except Exception as e:
+            src = f"(سورس در دسترس نبود: {e})"
+        report.append(f"--- Network.send ---\n{src}")
 
     full = "\n\n".join(report)
     for i in range(0, len(full), 3500):
@@ -488,7 +504,7 @@ def handle_join_choice(call):
 def join_channel_with_auth(auth: str, channel_id: str) -> tuple[bool, str]:
     def _build_client():
         try:
-            return Client(name="temp_join_session", auth=auth.strip())
+            return Client(name=f"temp_join_{abs(hash(auth))}", auth=auth.strip())
         except TypeError as e:
             sig = inspect.signature(Client.__init__)
             raise TypeError(f"امضای واقعی Client.__init__{sig} — {e}")
