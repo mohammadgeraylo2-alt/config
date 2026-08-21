@@ -23,6 +23,13 @@ try:
 except ImportError:
     Crypto = None
 
+try:
+    from Crypto.PublicKey import RSA
+    from Crypto.Signature import pkcs1_15
+except ImportError:
+    RSA = None
+    pkcs1_15 = None
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("auth-checker-rubpy")
 
@@ -103,19 +110,30 @@ async def _disconnect_client(client):
             pass
 
 
-def check_single_auth(auth: str) -> tuple[bool, str]:
+def make_import_key(private_key_pem: str):
+    """Client.import_key امضاکننده‌ای که Network.send برای هر درخواست واقعی لازم داره رو می‌سازه."""
+    if RSA is None or pkcs1_15 is None:
+        raise RuntimeError("pycryptodome نصب نیست")
+    return pkcs1_15.new(RSA.import_key(private_key_pem))
+
+
+def check_single_auth(auth: str, private_key: str) -> tuple[bool, str]:
     auth = auth.strip()
     if not auth:
         return False, "خالی بود"
+    if not private_key or not private_key.strip():
+        return False, "private_key هم لازمه (برای امضای درخواست‌ها)"
     if Client is None:
         return False, "کتابخونه rubpy نصب نیست"
     if len(auth) != 32:
-        return False, f"auth باید ۳۲ کاراکتر باشه (الان {len(auth)} کاراکتره) — احتمالاً auth رمزگشایی‌نشده رو فرستادی"
+        return False, f"auth باید ۳۲ کاراکتر باشه (الان {len(auth)} کاراکتره)"
 
     async def _check():
-        client = Client(name=f"temp_check_{abs(hash(auth))}", auth=auth)
+        client = Client(name=f"temp_check_{abs(hash(auth))}", auth=auth, private_key=private_key)
+        client.import_key = make_import_key(private_key)
         if callable(getattr(client, "connect", None)):
             await client.connect()
+            client.import_key = make_import_key(private_key)  # connect ممکنه از سشن محلی چیز دیگه‌ای لود کنه
         try:
             fn = getattr(client, "get_me", None) or getattr(client, "get_chats", None)
             if fn is None:
@@ -420,24 +438,30 @@ def login_process_code(message):
 
     if auth:
         bot.edit_message_text(
-            f"{detail} ✅\n\nauth این اکانت:\n`{auth}`\n\nاین رو جایی امن نگه دار.",
-            chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="Markdown",
+            f"{detail} ✅\n\nبرای /check این دو خط رو (با یه خط خالی از اکانت بعدی جدا) بفرست:\n\n"
+            f"{auth}\n{pending['private_pem']}",
+            chat_id=status_msg.chat.id, message_id=status_msg.message_id,
         )
     else:
         bot.edit_message_text(detail, chat_id=status_msg.chat.id, message_id=status_msg.message_id)
 
 
-def parse_auth_list(raw: str) -> list[str]:
+def parse_auth_entries(raw: str) -> list[tuple[str, str]]:
+    """
+    هر اکانت به‌صورت دو خط پشت‌سرهم می‌فرستی: auth بعد private_key.
+    private_key چندخطیه (فرمت PEM)، پس با یه خط خالی از اکانت بعدی جدا می‌شه.
+    """
     raw = raw.strip()
-    if raw.startswith("[") and raw.endswith("]"):
-        try:
-            data = json.loads(raw)
-            return [str(item).strip() for item in data if str(item).strip()]
-        except json.JSONDecodeError:
-            pass
-    cleaned = raw.replace("[", "").replace("]", "")
-    parts = re.split(r"[\n,]+", cleaned)
-    return [p.strip().strip('"').strip("'") for p in parts if p.strip().strip('"').strip("'")]
+    blocks = re.split(r"\n\s*\n", raw)
+    entries = []
+    for block in blocks:
+        lines = [line for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        auth = lines[0].strip()
+        private_key = "\n".join(lines[1:]).strip()
+        entries.append((auth, private_key))
+    return entries
 
 
 @bot.message_handler(commands=["start", "help"])
@@ -452,35 +476,39 @@ def start(message):
 @bot.message_handler(commands=["check"])
 def ask_auths(message):
     waiting_for_auths.add(message.chat.id)
-    bot.reply_to(message, "باشه، حالا Authهات رو بفرست (هر کدوم توی یه خط جدا).")
+    bot.reply_to(
+        message,
+        "باشه، حالا اکانت‌هات رو بفرست: هر اکانت دو خط (auth بعدش private_key)، "
+        "و بین اکانت‌های مختلف یه خط خالی بذار.",
+    )
 
 
 @bot.message_handler(func=lambda m: m.chat.id in waiting_for_auths, content_types=["text"])
 def process_auths(message):
     waiting_for_auths.discard(message.chat.id)
 
-    auths = parse_auth_list(message.text)
-    if not auths:
+    entries = parse_auth_entries(message.text)
+    if not entries:
         bot.reply_to(message, "چیزی دریافت نشد. دوباره /check رو بزن.")
         return
 
-    status_msg = bot.reply_to(message, f"در حال بررسی {len(auths)} اکانت...")
+    status_msg = bot.reply_to(message, f"در حال بررسی {len(entries)} اکانت...")
 
-    healthy, healthy_auths, lines = 0, [], []
-    for i, auth in enumerate(auths, start=1):
-        ok, detail = check_single_auth(auth)
+    healthy, healthy_entries, lines = 0, [], []
+    for i, (auth, private_key) in enumerate(entries, start=1):
+        ok, detail = check_single_auth(auth, private_key)
         if ok:
             healthy += 1
-            healthy_auths.append(auth)
+            healthy_entries.append((auth, private_key))
             lines.append(f"✅ اکانت {i}: سالم")
         else:
             lines.append(f"❌ اکانت {i}: مشکل دارد ({detail})")
 
-    summary = "نتیجه بررسی:\n\n" + "\n".join(lines) + f"\n\n📊 جمع‌بندی: {healthy} از {len(auths)} سالم."
+    summary = "نتیجه بررسی:\n\n" + "\n".join(lines) + f"\n\n📊 جمع‌بندی: {healthy} از {len(entries)} سالم."
     bot.edit_message_text(summary, chat_id=status_msg.chat.id, message_id=status_msg.message_id)
 
-    if healthy_auths:
-        healthy_auths_by_chat[message.chat.id] = healthy_auths
+    if healthy_entries:
+        healthy_auths_by_chat[message.chat.id] = healthy_entries
         markup = types.InlineKeyboardMarkup()
         markup.add(
             types.InlineKeyboardButton("بله، اد کن ✅", callback_data="join_yes"),
@@ -507,18 +535,13 @@ def handle_join_choice(call):
     bot.edit_message_text("آیدی یا لینک کانال روبیکا رو بفرست.", chat_id=chat_id, message_id=call.message.message_id)
 
 
-def join_channel_with_auth(auth: str, channel_id: str) -> tuple[bool, str]:
-    def _build_client():
-        try:
-            return Client(name=f"temp_join_{abs(hash(auth))}", auth=auth.strip())
-        except TypeError as e:
-            sig = inspect.signature(Client.__init__)
-            raise TypeError(f"امضای واقعی Client.__init__{sig} — {e}")
-
+def join_channel_with_auth(auth: str, private_key: str, channel_id: str) -> tuple[bool, str]:
     async def _join():
-        client = _build_client()
+        client = Client(name=f"temp_join_{abs(hash(auth))}", auth=auth.strip(), private_key=private_key)
+        client.import_key = make_import_key(private_key)
         if callable(getattr(client, "connect", None)):
             await client.connect()
+            client.import_key = make_import_key(private_key)
         try:
             join_fn = next(
                 (getattr(client, n) for n in dir(client) if "join" in n.lower() and callable(getattr(client, n))),
@@ -544,21 +567,21 @@ def process_channel_join(message):
     waiting_for_channel.discard(chat_id)
 
     channel_id = message.text.strip()
-    healthy_auths = healthy_auths_by_chat.pop(chat_id, [])
-    if not healthy_auths:
+    healthy_entries = healthy_auths_by_chat.pop(chat_id, [])
+    if not healthy_entries:
         bot.reply_to(message, "لیست اکانت سالمی پیدا نشد. دوباره /check رو بزن.")
         return
 
-    status_msg = bot.reply_to(message, f"در حال اد کردن {len(healthy_auths)} اکانت به کانال...")
+    status_msg = bot.reply_to(message, f"در حال اد کردن {len(healthy_entries)} اکانت به کانال...")
 
     joined, lines = 0, []
-    for i, auth in enumerate(healthy_auths, start=1):
-        ok, detail = join_channel_with_auth(auth, channel_id)
+    for i, (auth, private_key) in enumerate(healthy_entries, start=1):
+        ok, detail = join_channel_with_auth(auth, private_key, channel_id)
         if ok:
             joined += 1
         lines.append(f"{'✅' if ok else '❌'} اکانت {i}: {detail}")
 
-    summary = "نتیجه اد کردن:\n\n" + "\n".join(lines) + f"\n\n📊 {joined} از {len(healthy_auths)} موفق."
+    summary = "نتیجه اد کردن:\n\n" + "\n".join(lines) + f"\n\n📊 {joined} از {len(healthy_entries)} موفق."
     bot.edit_message_text(summary, chat_id=status_msg.chat.id, message_id=status_msg.message_id)
 
 
@@ -567,4 +590,3 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده!")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-    
