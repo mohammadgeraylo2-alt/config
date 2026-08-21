@@ -225,6 +225,31 @@ def debugcrypto_cmd(message):
         bot.send_message(message.chat.id, full[i:i + 3500])
 
 
+@bot.message_handler(commands=["debugcryptosrc"])
+def debugcryptosrc_cmd(message):
+    try:
+        from rubpy.crypto import Crypto
+    except ImportError as e:
+        bot.reply_to(message, f"ایمپورت شکست خورد: {e}")
+        return
+
+    lines = [f"متدهای کلاس Crypto: {[n for n in dir(Crypto) if not n.startswith('_')]}", ""]
+    for name in dir(Crypto):
+        if name.startswith("_"):
+            continue
+        attr = getattr(Crypto, name)
+        if callable(attr):
+            try:
+                src = inspect.getsource(attr)
+            except Exception as e:
+                src = f"(سورس در دسترس نبود: {e})"
+            lines.append(f"--- {name} ---\n{src}")
+
+    full = "\n\n".join(lines)
+    for i in range(0, len(full), 3500):
+        bot.send_message(message.chat.id, full[i:i + 3500])
+
+
 def start_login(phone: str):
     if Client is None:
         return False, None, None, None, None, "کتابخونه rubpy نصب نیست"
