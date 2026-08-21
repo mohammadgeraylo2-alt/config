@@ -247,6 +247,31 @@ def debugcryptosrc_cmd(message):
         bot.send_message(message.chat.id, full[i:i + 3500])
 
 
+@bot.message_handler(commands=["debugconnect"])
+def debugconnect_cmd(message):
+    if Client is None:
+        bot.reply_to(message, "کتابخونه rubpy نصب نیست.")
+        return
+    try:
+        client = Client(name=os.path.join(SESSIONS_DIR, "debug_probe3"), auth="a" * 32)
+    except Exception as e:
+        bot.reply_to(message, f"ساخت Client شکست خورد: {type(e).__name__}: {e}")
+        return
+
+    report = []
+    for name in ("connect", "builder"):
+        fn = getattr(client, name, None)
+        try:
+            src = inspect.getsource(fn) if fn else f"{name}: پیدا نشد"
+        except Exception as e:
+            src = f"(سورس در دسترس نبود: {e})"
+        report.append(f"--- {name} ---\n{src}")
+
+    full = "\n\n".join(report)
+    for i in range(0, len(full), 3500):
+        bot.send_message(message.chat.id, full[i:i + 3500])
+
+
 def start_login(phone: str):
     if Client is None:
         return False, None, None, None, None, "کتابخونه rubpy نصب نیست"
@@ -520,3 +545,4 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده!")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
+    
