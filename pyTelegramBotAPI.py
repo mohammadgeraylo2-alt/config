@@ -252,36 +252,42 @@ def debugconnect_cmd(message):
     if Client is None:
         bot.reply_to(message, "کتابخونه rubpy نصب نیست.")
         return
-    try:
+
+    async def _gather():
         client = Client(name=os.path.join(SESSIONS_DIR, "debug_probe3"), auth="a" * 32)
+        report = []
+        for name in ("connect", "builder"):
+            fn = getattr(client, name, None)
+            try:
+                src = inspect.getsource(fn) if fn else f"{name}: پیدا نشد"
+            except Exception as e:
+                src = f"(سورس در دسترس نبود: {e})"
+            report.append(f"--- {name} ---\n{src}")
+
+        try:
+            await client.connect()
+        except Exception as e:
+            report.append(f"--- connect() اجرا شد ولی خطا داد: {type(e).__name__}: {e} ---")
+
+        conn = getattr(client, "connection", None)
+        if conn is not None:
+            send_fn = getattr(conn, "send", None)
+            try:
+                src = inspect.getsource(send_fn) if send_fn else "send: پیدا نشد"
+            except Exception as e:
+                src = f"(سورس در دسترس نبود: {e})"
+            report.append(f"--- Network.send ---\n{src}")
+        else:
+            report.append("--- connection هنوز None بود ---")
+
+        await _disconnect_client(client)
+        return report
+
+    try:
+        report = run_async(_gather())
     except Exception as e:
-        bot.reply_to(message, f"ساخت Client شکست خورد: {type(e).__name__}: {e}")
+        bot.reply_to(message, f"خطای کلی: {type(e).__name__}: {e}")
         return
-
-    report = []
-    for name in ("connect", "builder"):
-        fn = getattr(client, name, None)
-        try:
-            src = inspect.getsource(fn) if fn else f"{name}: پیدا نشد"
-        except Exception as e:
-            src = f"(سورس در دسترس نبود: {e})"
-        report.append(f"--- {name} ---\n{src}")
-
-    conn = getattr(client, "connection", None)
-    if conn is None:
-        try:
-            from rubpy.network import Network
-            conn = Network(client=client)
-        except Exception as e:
-            conn = None
-            report.append(f"--- Network: ساخت شکست خورد: {e} ---")
-    if conn is not None:
-        send_fn = getattr(conn, "send", None)
-        try:
-            src = inspect.getsource(send_fn) if send_fn else "send: پیدا نشد"
-        except Exception as e:
-            src = f"(سورس در دسترس نبود: {e})"
-        report.append(f"--- Network.send ---\n{src}")
 
     full = "\n\n".join(report)
     for i in range(0, len(full), 3500):
