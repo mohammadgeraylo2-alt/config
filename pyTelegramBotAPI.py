@@ -65,7 +65,7 @@ def generate_rsa_keypair() -> tuple[str, str]:
     """کلید عمومی به فرمت خام PKCS#1 base64 (بدون هدر PEM) برمی‌گردونه — فرمتی که روبیکا می‌خواد."""
     if RSA is None:
         raise RuntimeError("pycryptodome نصب نیست")
-    key = RSA.generate(1024)
+    key = RSA.generate(2048)
     private_pem = key.export_key().decode()
     pub = key.publickey()
     der = DerSequence([pub.n, pub.e]).encode()
@@ -445,4 +445,4 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده!")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-  
+    
