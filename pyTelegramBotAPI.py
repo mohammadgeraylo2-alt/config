@@ -110,8 +110,19 @@ def check_single_auth(auth: str, private_key: str = None) -> tuple[bool, str]:
     if Client is None:
         return False, "کتابخونه rubpy نصب نیست"
 
+    def _build_client():
+        # اول با auth+private_key امتحان می‌کنیم، اگه پارامترها جور نبود با فقط auth
+        try:
+            return Client(name="temp_check_session", auth=auth, private_key=private_key)
+        except TypeError:
+            try:
+                return Client(name="temp_check_session", auth=auth)
+            except TypeError as e:
+                sig = inspect.signature(Client.__init__)
+                raise TypeError(f"امضای واقعی Client.__init__{sig} — {e}")
+
     async def _check():
-        client = Client(name="temp_check_session", auth=auth, private_key=private_key)
+        client = _build_client()
         if callable(getattr(client, "connect", None)):
             await client.connect()
         try:
@@ -453,8 +464,15 @@ def handle_join_choice(call):
 
 
 def join_channel_with_auth(auth: str, channel_id: str) -> tuple[bool, str]:
+    def _build_client():
+        try:
+            return Client(name="temp_join_session", auth=auth.strip())
+        except TypeError as e:
+            sig = inspect.signature(Client.__init__)
+            raise TypeError(f"امضای واقعی Client.__init__{sig} — {e}")
+
     async def _join():
-        client = Client(name="temp_join_session", auth=auth.strip())
+        client = _build_client()
         if callable(getattr(client, "connect", None)):
             await client.connect()
         try:
@@ -505,4 +523,3 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده!")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
-                         
