@@ -103,26 +103,17 @@ async def _disconnect_client(client):
             pass
 
 
-def check_single_auth(auth: str, private_key: str = None) -> tuple[bool, str]:
+def check_single_auth(auth: str) -> tuple[bool, str]:
     auth = auth.strip()
     if not auth:
         return False, "خالی بود"
     if Client is None:
         return False, "کتابخونه rubpy نصب نیست"
-
-    def _build_client():
-        # اول با auth+private_key امتحان می‌کنیم، اگه پارامترها جور نبود با فقط auth
-        try:
-            return Client(name="temp_check_session", auth=auth, private_key=private_key)
-        except TypeError:
-            try:
-                return Client(name="temp_check_session", auth=auth)
-            except TypeError as e:
-                sig = inspect.signature(Client.__init__)
-                raise TypeError(f"امضای واقعی Client.__init__{sig} — {e}")
+    if len(auth) != 32:
+        return False, f"auth باید ۳۲ کاراکتر باشه (الان {len(auth)} کاراکتره) — احتمالاً auth رمزگشایی‌نشده رو فرستادی"
 
     async def _check():
-        client = _build_client()
+        client = Client(name="temp_check_session", auth=auth)
         if callable(getattr(client, "connect", None)):
             await client.connect()
         try:
@@ -282,7 +273,7 @@ def start_login(phone: str):
         return False, None, None, None, None, f"{type(e).__name__}: {e}"
 
 
-def submit_login_code(session_name: str, phone: str, code: str, send_code_result, public_key_pem: str):
+def submit_login_code(session_name: str, phone: str, code: str, send_code_result, public_key_pem: str, private_key_pem: str):
     phone_code_hash = extract_field(send_code_result, ["phone_code_hash", "code_hash", "hash"])
     if not phone_code_hash:
         return False, None, (
@@ -305,10 +296,15 @@ def submit_login_code(session_name: str, phone: str, code: str, send_code_result
         result = run_async(_submit())
         auth_val = extract_field(result, ["auth", "auth_key", "key"])
         if auth_val and Crypto is not None:
+            raw = str(auth_val)
             try:
-                auth_val = Crypto.decode_auth(str(auth_val))
+                # auth واقعی داخل این رشته با کلید خصوصی‌مون RSA-OAEP رمزگذاری شده
+                auth_val = Crypto.decrypt_RSA_OAEP(private_key_pem, raw)
             except Exception:
-                pass
+                try:
+                    auth_val = Crypto.decode_auth(raw)
+                except Exception:
+                    pass
         if auth_val:
             return True, str(auth_val), "ورود موفق"
         return True, None, f"موفق بود ولی auth پیدا نشد. فیلدهای واقعی:\n{dump_fields(result)}"
@@ -349,6 +345,7 @@ def login_process_phone(message):
         "phone": phone,
         "send_code_result": send_code_result,
         "public_pem": public_pem,
+        "private_pem": private_pem,
     }
     bot.edit_message_text(
         f"{detail}. حالا کدی که برای اکانت {phone} اومد رو بفرست.",
@@ -368,7 +365,7 @@ def login_process_code(message):
 
     ok, auth, detail = submit_login_code(
         pending["session_name"], pending["phone"], code,
-        pending["send_code_result"], pending["public_pem"],
+        pending["send_code_result"], pending["public_pem"], pending["private_pem"],
     )
     if not ok:
         bot.edit_message_text(f"ورود ناموفق بود: {detail}", chat_id=status_msg.chat.id, message_id=status_msg.message_id)
