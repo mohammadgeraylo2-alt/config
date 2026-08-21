@@ -19,11 +19,9 @@ except ImportError:
     Client = None
 
 try:
-    from Crypto.PublicKey import RSA
-    from Crypto.Util.asn1 import DerSequence
+    from rubpy.crypto import Crypto
 except ImportError:
-    RSA = None
-    DerSequence = None
+    Crypto = None
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("auth-checker-rubpy")
@@ -62,14 +60,11 @@ def build_kwargs(func, concept_values: dict) -> dict:
 
 
 def generate_rsa_keypair() -> tuple[str, str]:
-    """کلید عمومی به فرمت خام PKCS#1 base64 (بدون هدر PEM) برمی‌گردونه — فرمتی که روبیکا می‌خواد."""
-    if RSA is None:
-        raise RuntimeError("pycryptodome نصب نیست")
-    key = RSA.generate(2048)
-    private_pem = key.export_key().decode()
-    pub = key.publickey()
-    der = DerSequence([pub.n, pub.e]).encode()
-    return private_pem, base64.b64encode(der).decode()
+    """مستقیم از تابع خودِ rubpy استفاده می‌کنه تا فرمت public_key دقیقاً با چیزی که سرور می‌خواد یکی باشه."""
+    if Crypto is None:
+        raise RuntimeError("rubpy.crypto نصب نیست")
+    public_key, private_key = Crypto.create_keys()
+    return private_key, public_key
 
 
 def extract_field(obj, candidates: list[str]):
@@ -298,6 +293,11 @@ def submit_login_code(session_name: str, phone: str, code: str, send_code_result
     try:
         result = run_async(_submit())
         auth_val = extract_field(result, ["auth", "auth_key", "key"])
+        if auth_val and Crypto is not None:
+            try:
+                auth_val = Crypto.decode_auth(str(auth_val))
+            except Exception:
+                pass
         if auth_val:
             return True, str(auth_val), "ورود موفق"
         return True, None, f"موفق بود ولی auth پیدا نشد. فیلدهای واقعی:\n{dump_fields(result)}"
@@ -505,3 +505,4 @@ if __name__ == "__main__":
         log.warning("BOT_TOKEN تنظیم نشده!")
     log.info("ربات در حال اجراست...")
     bot.infinity_polling()
+                         
