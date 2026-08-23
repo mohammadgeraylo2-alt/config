@@ -1,592 +1,415 @@
-"""
-ربات تلگرامی چک اکانت روبیکا + لاگین با شماره (rubpy)
-requirements.txt: pyTelegramBotAPI, rubpy
-"""
-
+# core.py — merged: config + kucoin client + indicators + strategy + backtest + walk-forward
 import os
-import re
-import json
-import asyncio
-import inspect
+import time
+import itertools
+from dataclasses import dataclass, asdict
+
+import httpx
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ============================== CONFIG ==============================
+
+@dataclass
+class Config:
+    token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    base_url: str = os.getenv("KUCOIN_BASE_URL", "https://api-futures.kucoin.com")
+    symbol: str = os.getenv("DEFAULT_SYMBOL", "XBTUSDTM")
+    capital: float = float(os.getenv("DEFAULT_CAPITAL", "10000"))
+    risk: float = float(os.getenv("DEFAULT_RISK", "0.005"))
+    fee: float = float(os.getenv("DEFAULT_FEE", "0.0006"))
+    slippage: float = float(os.getenv("DEFAULT_SLIPPAGE", "0.0002"))
+
+CFG = Config()
+
+# ============================== KUCOIN CLIENT ==============================
+
+INTERVALS = {"15m": 15, "1h": 60, "4h": 240}
+
+class KuCoinFutures:
+    def __init__(self, base_url="https://api-futures.kucoin.com", uta_url="https://api.kucoin.com"):
+        self.base_url = base_url.rstrip("/")
+        self.uta_url = uta_url.rstrip("/")
+
+    def _get(self, url, params):
+        with httpx.Client(timeout=30) as client:
+            r = client.get(url, params=params)
+            r.raise_for_status()
+            payload = r.json()
+        if payload.get("code") != "200000":
+            raise RuntimeError(payload)
+        return payload.get("data")
+
+    def klines(self, symbol, start, end, interval="15m"):
+        if interval not in INTERVALS:
+            raise ValueError("Supported intervals: 15m, 1h, 4h")
+        granularity = INTERVALS[interval]
+        start_ts = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+        end_ts = int(pd.Timestamp(end, tz="UTC").timestamp() * 1000)
+        step = granularity * 60 * 1000
+        rows, cursor = [], start_ts
+        while cursor < end_ts:
+            data = self._get(
+                f"{self.base_url}/api/v1/kline/query",
+                {"symbol": symbol, "granularity": granularity, "from": cursor, "to": end_ts}
+            ) or []
+            if not data: break
+            rows.extend(data)
+            last = max(int(x[0]) for x in data)
+            nxt = last + step
+            if nxt <= cursor: break
+            cursor = nxt
+            time.sleep(0.12)
+            if len(data) < 500: break
+
+        if not rows:
+            raise RuntimeError("KuCoin returned no Futures candles.")
+        df = pd.DataFrame(rows).iloc[:, :7]
+        df.columns = ["timestamp","open","close","high","low","volume","turnover"]
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        for c in ["open","high","low","close","volume","turnover"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.dropna().drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)[
+            ["timestamp","open","high","low","close","volume"]
+        ]
+
+    def funding_history(self, symbol, start, end):
+        # UTA public endpoint: historical settlement funding.
+        start_ts = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+        end_ts = int(pd.Timestamp(end, tz="UTC").timestamp() * 1000)
+        data = self._get(
+            f"{self.uta_url}/api/ua/v1/market/funding-rate-history",
+            {"symbol": symbol, "startAt": start_ts, "endAt": end_ts}
+        ) or {}
+        rows = data.get("list", []) if isinstance(data, dict) else data
+        if not rows:
+            return pd.DataFrame(columns=["timestamp","funding_rate"])
+        out = pd.DataFrame(rows)
+        out["timestamp"] = pd.to_datetime(out["ts"], unit="ms", utc=True)
+        out["funding_rate"] = pd.to_numeric(out["fundingRate"], errors="coerce")
+        return out[["timestamp","funding_rate"]].dropna().drop_duplicates("timestamp").sort_values("timestamp")
+
+    def open_interest_history(self, symbol, start, end, interval="15min", page_size=200):
+        # UTA OI endpoint. KuCoin documents intraday OI history retention as limited;
+        # this method raises a clear error when the requested range is unavailable.
+        start_ts = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+        end_ts = int(pd.Timestamp(end, tz="UTC").timestamp() * 1000)
+        rows, cursor = [], start_ts
+        while cursor < end_ts:
+            data = self._get(
+                f"{self.uta_url}/api/ua/v1/market/open-interest",
+                {"symbol": symbol, "interval": interval, "startAt": cursor, "endAt": end_ts,
+                 "pageSize": page_size}
+            ) or []
+            if not data: break
+            rows.extend(data)
+            ts = [int(x["ts"]) for x in data if "ts" in x]
+            if not ts: break
+            nxt = max(ts) + 1
+            if nxt <= cursor: break
+            cursor = nxt
+            time.sleep(0.12)
+            if len(data) < page_size: break
+
+        if not rows:
+            raise RuntimeError(
+                "KuCoin returned no historical OI. KuCoin currently limits intraday historical OI retention; "
+                "try a range within the documented retention window or run without OI."
+            )
+        out = pd.DataFrame(rows)
+        out["timestamp"] = pd.to_datetime(out["ts"], unit="ms", utc=True)
+        out["open_interest"] = pd.to_numeric(out["openInterest"], errors="coerce")
+        return out[["timestamp","open_interest"]].dropna().drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+
+    def market_features(self, symbol, start, end, require_oi=False):
+        funding = self.funding_history(symbol, start, end)
+        try:
+            oi = self.open_interest_history(symbol, start, end, "15min")
+            oi_available = True
+        except RuntimeError:
+            if require_oi:
+                raise
+            oi = pd.DataFrame(columns=["timestamp","open_interest"])
+            oi_available = False
+        return funding, oi, oi_available
+
+# ============================== INDICATORS ==============================
+
+def ema(s,n): return s.ewm(span=n, adjust=False).mean()
+
+def atr(df,n=14):
+    p=df.close.shift(1)
+    tr=pd.concat([df.high-df.low,(df.high-p).abs(),(df.low-p).abs()],axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n,adjust=False).mean()
+
+def rsi(s,n=14):
+    d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
+    au=up.ewm(alpha=1/n,adjust=False).mean()
+    ad=dn.ewm(alpha=1/n,adjust=False).mean()
+    rs=au/ad.replace(0,np.nan)
+    return 100-100/(1+rs)
+
+def adx(df,n=14):
+    up=df.high.diff(); dn=-df.low.diff()
+    plus=up.where((up>dn)&(up>0),0.0)
+    minus=dn.where((dn>up)&(dn>0),0.0)
+    p=df.close.shift(1)
+    tr=pd.concat([df.high-df.low,(df.high-p).abs(),(df.low-p).abs()],axis=1).max(axis=1)
+    av=tr.ewm(alpha=1/n,adjust=False).mean()
+    pi=100*plus.ewm(alpha=1/n,adjust=False).mean()/av.replace(0,np.nan)
+    mi=100*minus.ewm(alpha=1/n,adjust=False).mean()/av.replace(0,np.nan)
+    dx=100*(pi-mi).abs()/(pi+mi).replace(0,np.nan)
+    return dx.ewm(alpha=1/n,adjust=False).mean()
+
+def indicators(df):
+    x=df.copy()
+    for n in (20,50,200): x[f"ema{n}"]=ema(x.close,n)
+    x["atr"]=atr(x); x["rsi"]=rsi(x.close); x["adx"]=adx(x)
+    x["vol_ma"]=x.volume.rolling(20).mean()
+    return x
+
+# ============================== STRATEGY ==============================
+
+def resample(df, rule):
+    x=df.set_index("timestamp")
+    return x.resample(rule,label="right",closed="right").agg({
+        "open":"first","high":"max","low":"min","close":"last","volume":"sum"
+    }).dropna().reset_index()
+
+def attach_features(m, funding=None, oi=None):
+    z=m.copy().sort_values("timestamp")
+    if funding is not None and not funding.empty:
+        f=funding.sort_values("timestamp").copy()
+        # Do not use the funding settlement that occurs at the same candle:
+        # the backtest only sees funding that was already settled/known.
+        z=pd.merge_asof(z, f, on="timestamp", direction="backward", allow_exact_matches=False)
+    else:
+        z["funding_rate"]=0.0
+    if oi is not None and not oi.empty:
+        o=oi.sort_values("timestamp").copy()
+        z=pd.merge_asof(z, o, on="timestamp", direction="backward", allow_exact_matches=False)
+        z["oi_change_24h"]=z["open_interest"].pct_change(96)
+        z["oi_change_4h"]=z["open_interest"].pct_change(16)
+    else:
+        z["open_interest"]=float("nan")
+        z["oi_change_24h"]=0.0
+        z["oi_change_4h"]=0.0
+    return z
+
+def signals(df15, funding=None, oi=None, params=None):
+    p={"adx_min":22.0,"funding_long_max":0.0010,"funding_short_min":-0.0010,
+       "oi_min_change":-1.0}
+    if params: p.update(params)
+    m=indicators(df15)
+    h1=indicators(resample(df15,"1h"))
+    h4=indicators(resample(df15,"4h"))
+
+    a=attach_features(m,funding,oi).set_index("timestamp")
+    b=h1.set_index("timestamp")[["close","ema50","ema200","adx"]].add_prefix("h1_")
+    c=h4.set_index("timestamp")[["close","ema50","ema200"]].add_prefix("h4_")
+    z=a.join(b,how="left").join(c,how="left").ffill().reset_index()
+
+    long_reg=(z.h4_close>z.h4_ema200)&(z.h4_ema50>z.h4_ema200)
+    short_reg=(z.h4_close<z.h4_ema200)&(z.h4_ema50<z.h4_ema200)
+    long_tr=(z.h1_close>z.h1_ema200)&(z.h1_ema50>z.h1_ema200)&(z.h1_adx>=p["adx_min"])
+    short_tr=(z.h1_close<z.h1_ema200)&(z.h1_ema50<z.h1_ema200)&(z.h1_adx>=p["adx_min"])
+    vol=z.volume>z.vol_ma
+
+    funding_long_ok=z.funding_rate.fillna(0)<=p["funding_long_max"]
+    funding_short_ok=z.funding_rate.fillna(0)>=p["funding_short_min"]
+    oi_ok=(z.oi_change_24h.fillna(0)>=p["oi_min_change"])
+
+    z["long_entry"]=long_reg&long_tr&(z.close>z.ema20)&(z.close.shift(1)<=z.ema20.shift(1))&vol&(z.rsi>50)&funding_long_ok&oi_ok
+    z["short_entry"]=short_reg&short_tr&(z.close<z.ema20)&(z.close.shift(1)>=z.ema20.shift(1))&vol&(z.rsi<50)&funding_short_ok&oi_ok
+    return z.dropna(subset=["atr","h1_ema200","h4_ema200"]).reset_index(drop=True)
+
+# ============================== BACKTEST ==============================
+
+@dataclass
+class Trade:
+    side:str; entry_time:str; exit_time:str; entry:float; exit:float; qty:float; pnl:float; r:float; reason:str
+
+def run(df, capital=10000, risk=0.005, fee=0.0006, slippage=0.0002,
+        atr_mult=1.5, rr=2.0, max_bars=96, funding=None, oi=None, params=None):
+    z=signals(df,funding,oi,params); equity=capital; peak=capital; maxdd=0; pos=None; trades=[]; curve=[]
+    for i,row in z.iterrows():
+        price=float(row.close)
+        if pos:
+            out=None; reason=None
+            if pos["side"]=="LONG":
+                if row.low<=pos["sl"]: out,reason=pos["sl"],"SL"
+                elif row.high>=pos["tp"]: out,reason=pos["tp"],"TP"
+            else:
+                if row.high>=pos["sl"]: out,reason=pos["sl"],"SL"
+                elif row.low<=pos["tp"]: out,reason=pos["tp"],"TP"
+            if out is None and i-pos["i"]>=max_bars: out,reason=price,"TIME"
+            if out is not None:
+                gross=((out-pos["entry"]) if pos["side"]=="LONG" else (pos["entry"]-out))*pos["qty"]
+                costs=(pos["entry"]+out)*pos["qty"]*fee
+                pnl=gross-costs; equity+=pnl
+                trades.append(Trade(pos["side"],str(pos["time"]),str(row.timestamp),pos["entry"],out,pos["qty"],pnl,pnl/pos["risk_cash"],reason))
+                pos=None
+        if pos is None:
+            side="LONG" if bool(row.long_entry) else ("SHORT" if bool(row.short_entry) else None)
+            if side:
+                entry=price*(1+slippage if side=="LONG" else 1-slippage)
+                dist=max(float(row.atr)*atr_mult,price*0.002)
+                risk_cash=equity*risk; qty=risk_cash/dist
+                sl,tp=((entry-dist,entry+dist*rr) if side=="LONG" else (entry+dist,entry-dist*rr))
+                equity-=entry*qty*fee
+                pos={"side":side,"entry":entry,"sl":sl,"tp":tp,"qty":qty,"risk_cash":risk_cash,"time":row.timestamp,"i":i}
+        peak=max(peak,equity); maxdd=max(maxdd,(peak-equity)/peak if peak else 0)
+        curve.append({"timestamp":row.timestamp,"equity":equity})
+    if pos:
+        row=z.iloc[-1]; out=float(row.close)
+        gross=((out-pos["entry"]) if pos["side"]=="LONG" else (pos["entry"]-out))*pos["qty"]
+        pnl=gross-(pos["entry"]+out)*pos["qty"]*fee; equity+=pnl
+        trades.append(Trade(pos["side"],str(pos["time"]),str(row.timestamp),pos["entry"],out,pos["qty"],pnl,pnl/pos["risk_cash"],"END"))
+    t=pd.DataFrame([asdict(x) for x in trades]); c=pd.DataFrame(curve)
+    wins=int((t.pnl>0).sum()) if not t.empty else 0
+    gp=t.loc[t.pnl>0,"pnl"].sum() if not t.empty else 0
+    gl=-t.loc[t.pnl<0,"pnl"].sum() if not t.empty else 0
+    pf=gp/gl if gl else (float("inf") if gp else 0)
+    rets=c.equity.pct_change().dropna()
+    sharpe=rets.mean()/rets.std()*np.sqrt(365*24*4) if len(rets)>1 and rets.std() else 0
+    return {"start_capital":capital,"final_equity":equity,"pnl":equity-capital,"roi":equity/capital-1,
+            "trades":len(t),"win_rate":wins/len(t) if len(t) else 0,"profit_factor":pf,
+            "max_drawdown":maxdd,"sharpe":sharpe},t,c
+
+# ============================== WALK-FORWARD ==============================
+
+@dataclass
+class WFResult:
+    fold:int
+    train_start:str
+    train_end:str
+    test_start:str
+    test_end:str
+    atr_mult:float
+    rr:float
+    adx_min:float
+    funding_long_max:float
+    funding_short_min:float
+    oi_min_change:float
+    train_score:float
+    test_roi:float
+    test_pf:float
+    test_dd:float
+    test_trades:int
+
+def objective(s):
+    if s["trades"] < 5: return -999
+    pf=min(s["profit_factor"],4.0) if np.isfinite(s["profit_factor"]) else 4.0
+    return s["roi"] + 0.08*(pf-1) - 0.7*s["max_drawdown"]
+
+def optimize(train, funding, oi, capital, risk, fee, slippage, grid):
+    best=None
+    for vals in itertools.product(*grid.values()):
+        params=dict(zip(grid.keys(),vals))
+        s,_,_=run(train,capital,risk,fee,slippage,
+                  atr_mult=params["atr_mult"],rr=params["rr"],
+                  funding=funding,oi=oi,params=params)
+        score=objective(s)
+        if best is None or score>best["score"]:
+            best={"params":params,"score":score,"summary":s}
+    return best
+
+def walk_forward(df, funding=None, oi=None, capital=10000, risk=.005, fee=.0006, slippage=.0002,
+                 train_days=180, test_days=30, step_days=30, grid=None):
+    if grid is None:
+        grid={"atr_mult":[1.25,1.5,1.75,2.0],"rr":[1.5,2.0,2.5,3.0],
+              "adx_min":[20,22,25],"funding_long_max":[0.0005,0.001,0.002],
+              "funding_short_min":[-0.002,-0.001,-0.0005],"oi_min_change":[-1.0,0.0,0.01]}
+    x=df.sort_values("timestamp").reset_index(drop=True)
+    start=x.timestamp.min(); end=x.timestamp.max()
+    fold=0; rows=[]; tests=[]; cursor=start
+    while cursor + pd.Timedelta(days=train_days+test_days) <= end:
+        tr_end=cursor+pd.Timedelta(days=train_days)
+        te_end=tr_end+pd.Timedelta(days=test_days)
+        train=x[(x.timestamp>=cursor)&(x.timestamp<tr_end)]
+        test=x[(x.timestamp>=tr_end)&(x.timestamp<te_end)]
+        ftr=funding[(funding.timestamp>=cursor)&(funding.timestamp<tr_end)] if funding is not None and not funding.empty else funding
+        fte=funding[(funding.timestamp>=tr_end)&(funding.timestamp<te_end)] if funding is not None and not funding.empty else funding
+        otr=oi[(oi.timestamp>=cursor)&(oi.timestamp<tr_end)] if oi is not None and not oi.empty else oi
+        ote=oi[(oi.timestamp>=tr_end)&(oi.timestamp<te_end)] if oi is not None and not oi.empty else oi
+        if len(train)>1000 and len(test)>100:
+            best=optimize(train,ftr,otr,capital,risk,fee,slippage,grid)
+            ts,tt,_=run(test,capital,risk,fee,slippage,best["params"]["atr_mult"],best["params"]["rr"],96,fte,ote,best["params"])
+            p=best["params"]
+            rows.append(asdict(WFResult(fold,str(cursor),str(tr_end),str(tr_end),str(te_end),
+                p["atr_mult"],p["rr"],p["adx_min"],p["funding_long_max"],p["funding_short_min"],
+                p["oi_min_change"],best["score"],ts["roi"],ts["profit_factor"],ts["max_drawdown"],ts["trades"])))
+            if not tt.empty: tests.append(tt)
+            fold+=1
+        cursor += pd.Timedelta(days=step_days)
+    result=pd.DataFrame(rows)
+    trades=pd.concat(tests,ignore_index=True) if tests else pd.DataFrame()
+    summary={
+        "folds":len(result),
+        "oos_roi_compounded": float((1+result.test_roi).prod()-1) if len(result) else 0,
+        "median_test_roi": float(result.test_roi.median()) if len(result) else 0,
+        "median_test_pf": float(result.test_pf.replace([np.inf,-np.inf],np.nan).median()) if len(result) else 0,
+        "worst_test_dd": float(result.test_dd.max()) if len(result) else 0,
+        "total_test_trades": int(result.test_trades.sum()) if len(result) else 0,
+    }
+    return summary,result,trades
+
+# ============================== TELEGRAM BOT ==============================
+
 import logging
-import base64
-import telebot
-from telebot import types
-
-try:
-    from rubpy import Client
-except ImportError:
-    Client = None
-
-try:
-    from rubpy.crypto import Crypto
-except ImportError:
-    Crypto = None
-
-try:
-    from Crypto.PublicKey import RSA
-    from Crypto.Signature import pkcs1_15
-except ImportError:
-    RSA = None
-    pkcs1_15 = None
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("auth-checker-rubpy")
+paused=False
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE")
-bot = telebot.TeleBot(BOT_TOKEN)
+async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "KuCoin Research Bot\n\n"
+        "/backtest XBTUSDTM 2025-01-01 2026-08-01 10000 0.005\n"
+        "/walkforward XBTUSDTM 2025-01-01 2026-08-01\n"
+        "/status\n/pause\n/resume"
+    )
 
-SESSIONS_DIR = "login_sessions"
-os.makedirs(SESSIONS_DIR, exist_ok=True)
+async def status(update,context): await update.message.reply_text("Status: PAUSED" if paused else "Status: READY")
+async def pause(update,context):
+    global paused; paused=True; await update.message.reply_text("Paused.")
+async def resume(update,context):
+    global paused; paused=False; await update.message.reply_text("Resumed.")
 
-waiting_for_auths = set()
-waiting_for_channel = set()
-healthy_auths_by_chat = {}
-waiting_for_login_phone = set()
-pending_login_by_chat = {}  # chat_id -> {session_name, phone, send_code_result, public_pem}
-
-
-def run_async(coro):
-    return asyncio.run(coro)
-
-
-def build_kwargs(func, concept_values: dict) -> dict:
+async def backtest(update,context):
     try:
-        sig = inspect.signature(func)
-    except (TypeError, ValueError):
-        return {}
-    kwargs = {}
-    for name in sig.parameters:
-        if name in ("self", "args", "kwargs"):
-            continue
-        for concept, value in concept_values.items():
-            if concept in name.lower():
-                kwargs[name] = value
-                break
-    return kwargs
-
-
-def generate_rsa_keypair() -> tuple[str, str]:
-    """مستقیم از تابع خودِ rubpy استفاده می‌کنه تا فرمت public_key دقیقاً با چیزی که سرور می‌خواد یکی باشه."""
-    if Crypto is None:
-        raise RuntimeError("rubpy.crypto نصب نیست")
-    public_key, private_key = Crypto.create_keys()
-    return private_key, public_key
-
-
-def extract_field(obj, candidates: list[str]):
-    for name in candidates:
-        if isinstance(obj, dict) and name in obj:
-            return obj[name]
-        if hasattr(obj, name) and getattr(obj, name) is not None:
-            return getattr(obj, name)
-    return None
-
-
-def dump_fields(obj) -> str:
-    """همه‌ی فیلدهای واقعی یه شیء رو برای دیباگ چاپ می‌کنه."""
-    if isinstance(obj, dict):
-        return repr(obj)
-    d = getattr(obj, "__dict__", None)
-    if d:
-        return repr(d)
-    return repr(obj)
-
-
-async def _make_client(session_name: str):
-    if Client is None:
-        raise RuntimeError("کتابخونه rubpy نصب نیست")
-    client = Client(name=os.path.join(SESSIONS_DIR, session_name))
-    if callable(getattr(client, "connect", None)):
-        await client.connect()
-    return client
-
-
-async def _disconnect_client(client):
-    if callable(getattr(client, "disconnect", None)):
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-
-
-def make_import_key(private_key_pem: str):
-    """Client.import_key امضاکننده‌ای که Network.send برای هر درخواست واقعی لازم داره رو می‌سازه."""
-    if RSA is None or pkcs1_15 is None:
-        raise RuntimeError("pycryptodome نصب نیست")
-    return pkcs1_15.new(RSA.import_key(private_key_pem))
-
-
-def check_single_auth(auth: str, private_key: str) -> tuple[bool, str]:
-    auth = auth.strip()
-    if not auth:
-        return False, "خالی بود"
-    if not private_key or not private_key.strip():
-        return False, "private_key هم لازمه (برای امضای درخواست‌ها)"
-    if Client is None:
-        return False, "کتابخونه rubpy نصب نیست"
-    if len(auth) != 32:
-        return False, f"auth باید ۳۲ کاراکتر باشه (الان {len(auth)} کاراکتره)"
-
-    async def _check():
-        client = Client(name=f"temp_check_{abs(hash(auth))}", auth=auth, private_key=private_key)
-        client.import_key = make_import_key(private_key)
-        if callable(getattr(client, "connect", None)):
-            await client.connect()
-            client.import_key = make_import_key(private_key)  # connect ممکنه از سشن محلی چیز دیگه‌ای لود کنه
-        try:
-            fn = getattr(client, "get_me", None) or getattr(client, "get_chats", None)
-            if fn is None:
-                raise AttributeError("نه get_me نه get_chats پیدا شد")
-            return await fn()
-        finally:
-            await _disconnect_client(client)
-
-    try:
-        result = run_async(_check())
-        return (True, "سالم") if result is not None else (False, "پاسخ خالی از سرور")
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-
-def debug_rubpy_signatures() -> str:
-    if Client is None:
-        return "کتابخونه rubpy نصب نیست."
-    try:
-        client = Client(name=os.path.join(SESSIONS_DIR, "debug_probe"))
-    except Exception as e:
-        return f"ساخت Client شکست خورد: {type(e).__name__}: {e}"
-
-    keys = ("send_code", "sign_in", "login", "code", "connect", "get_me", "get_chats", "key", "rsa", "crypto")
-    lines = []
-    for name in [n for n in dir(client) if any(k in n.lower() for k in keys)]:
-        try:
-            attr = getattr(client, name)
-        except Exception as e:
-            lines.append(f"• {name}: خطا ({type(e).__name__})")
-            continue
-        if callable(attr):
-            try:
-                lines.append(f"• {name}{inspect.signature(attr)}  [متد]")
-            except (TypeError, ValueError):
-                lines.append(f"• {name}(...)  [متد]")
-        else:
-            lines.append(f"• {name} = {attr!r}  [اتریبیوت]")
-    return "امضای متدها/اتریبیوت‌ها:\n" + "\n".join(lines)
-
-
-@bot.message_handler(commands=["debugrubpy"])
-def debugrubpy_cmd(message):
-    bot.reply_to(message, debug_rubpy_signatures())
-
-
-@bot.message_handler(commands=["debugsource"])
-def debugsource_cmd(message):
-    if Client is None:
-        bot.reply_to(message, "کتابخونه rubpy نصب نیست.")
-        return
-    try:
-        client = Client(name=os.path.join(SESSIONS_DIR, "debug_probe2"))
-    except Exception as e:
-        bot.reply_to(message, f"ساخت Client شکست خورد: {type(e).__name__}: {e}")
-        return
-
-    report = []
-    for name in ("send_code", "sign_in"):
-        fn = getattr(client, name, None)
-        try:
-            src = inspect.getsource(fn) if fn else f"{name}: پیدا نشد"
-        except Exception as e:
-            src = f"(سورس در دسترس نبود: {e})"
-        report.append(f"--- {name} ---\n{src}")
-
-    full = "\n\n".join(report)
-    for i in range(0, len(full), 3500):
-        bot.send_message(message.chat.id, full[i:i + 3500])
-
-
-@bot.message_handler(commands=["debugcrypto"])
-def debugcrypto_cmd(message):
-    """کل پکیج rubpy رو برای هر چیزی مرتبط با تولید کلید/رمزنگاری می‌گرده."""
-    try:
-        import rubpy
-        import pkgutil
-        import importlib
-    except ImportError as e:
-        bot.reply_to(message, f"ایمپورت rubpy شکست خورد: {e}")
-        return
-
-    lines = []
-    seen = set()
-    for finder, name, ispkg in pkgutil.walk_packages(rubpy.__path__, prefix="rubpy."):
-        try:
-            mod = importlib.import_module(name)
-        except Exception:
-            continue
-        for attr_name in dir(mod):
-            if attr_name.startswith("_") or attr_name in seen:
-                continue
-            lname = attr_name.lower()
-            if any(k in lname for k in ("rsa", "keypair", "generate_key", "genkey", "keygen", "public_key", "crypto")):
-                seen.add(attr_name)
-                lines.append(f"{name}.{attr_name}")
-
-    if not lines:
-        bot.reply_to(message, "هیچ چیز مرتبطی تو کل پکیج rubpy پیدا نشد.")
-        return
-
-    full = "موارد پیدا‌شده:\n" + "\n".join(lines)
-    for i in range(0, len(full), 3500):
-        bot.send_message(message.chat.id, full[i:i + 3500])
-
-
-@bot.message_handler(commands=["debugcryptosrc"])
-def debugcryptosrc_cmd(message):
-    try:
-        from rubpy.crypto import Crypto
-    except ImportError as e:
-        bot.reply_to(message, f"ایمپورت شکست خورد: {e}")
-        return
-
-    lines = [f"متدهای کلاس Crypto: {[n for n in dir(Crypto) if not n.startswith('_')]}", ""]
-    for name in dir(Crypto):
-        if name.startswith("_"):
-            continue
-        attr = getattr(Crypto, name)
-        if callable(attr):
-            try:
-                src = inspect.getsource(attr)
-            except Exception as e:
-                src = f"(سورس در دسترس نبود: {e})"
-            lines.append(f"--- {name} ---\n{src}")
-
-    full = "\n\n".join(lines)
-    for i in range(0, len(full), 3500):
-        bot.send_message(message.chat.id, full[i:i + 3500])
-
-
-@bot.message_handler(commands=["debugconnect"])
-def debugconnect_cmd(message):
-    if Client is None:
-        bot.reply_to(message, "کتابخونه rubpy نصب نیست.")
-        return
-
-    async def _gather():
-        client = Client(name=os.path.join(SESSIONS_DIR, "debug_probe3"), auth="a" * 32)
-        report = []
-        for name in ("connect", "builder"):
-            fn = getattr(client, name, None)
-            try:
-                src = inspect.getsource(fn) if fn else f"{name}: پیدا نشد"
-            except Exception as e:
-                src = f"(سورس در دسترس نبود: {e})"
-            report.append(f"--- {name} ---\n{src}")
-
-        try:
-            await client.connect()
-        except Exception as e:
-            report.append(f"--- connect() اجرا شد ولی خطا داد: {type(e).__name__}: {e} ---")
-
-        conn = getattr(client, "connection", None)
-        if conn is not None:
-            send_fn = getattr(conn, "send", None)
-            try:
-                src = inspect.getsource(send_fn) if send_fn else "send: پیدا نشد"
-            except Exception as e:
-                src = f"(سورس در دسترس نبود: {e})"
-            report.append(f"--- Network.send ---\n{src}")
-        else:
-            report.append("--- connection هنوز None بود ---")
-
-        await _disconnect_client(client)
-        return report
-
-    try:
-        report = run_async(_gather())
-    except Exception as e:
-        bot.reply_to(message, f"خطای کلی: {type(e).__name__}: {e}")
-        return
-
-    full = "\n\n".join(report)
-    for i in range(0, len(full), 3500):
-        bot.send_message(message.chat.id, full[i:i + 3500])
-
-
-def start_login(phone: str):
-    if Client is None:
-        return False, None, None, None, None, "کتابخونه rubpy نصب نیست"
-
-    phone = phone.strip()
-    session_name = re.sub(r"[^0-9]", "", phone) or "unknown"
-
-    try:
-        private_pem, public_pem = generate_rsa_keypair()
-    except Exception as e:
-        return False, None, None, None, None, f"ساخت کلید RSA شکست خورد: {e}"
-
-    async def _start():
-        client = await _make_client(f"login_{session_name}")
-        try:
-            return await client.send_code(phone_number=phone)
-        finally:
-            await _disconnect_client(client)
-
-    try:
-        result = run_async(_start())
-        return True, session_name, result, private_pem, public_pem, "کد تایید ارسال شد"
-    except Exception as e:
-        return False, None, None, None, None, f"{type(e).__name__}: {e}"
-
-
-def submit_login_code(session_name: str, phone: str, code: str, send_code_result, public_key_pem: str, private_key_pem: str):
-    phone_code_hash = extract_field(send_code_result, ["phone_code_hash", "code_hash", "hash"])
-    if not phone_code_hash:
-        return False, None, (
-            f"phone_code_hash پیدا نشد. فیلدهای واقعی send_code:\n{dump_fields(send_code_result)}"
+        a=context.args; symbol=a[0] if len(a)>0 else CFG.symbol
+        start=a[1] if len(a)>1 else "2025-01-01"; end=a[2] if len(a)>2 else "2026-08-01"
+        capital=float(a[3]) if len(a)>3 else CFG.capital; risk=float(a[4]) if len(a)>4 else CFG.risk
+        api=KuCoinFutures(CFG.base_url)
+        await update.message.reply_text("⏳ Downloading KuCoin candles + funding + OI...")
+        df=api.klines(symbol,start,end,"15m"); funding=api.funding_history(symbol,start,end)
+        try: oi=api.open_interest_history(symbol,start,end,"15min")
+        except RuntimeError: oi=None
+        s,t,c=run(df,capital,risk,CFG.fee,CFG.slippage,funding=funding,oi=oi)
+        Path("reports").mkdir(exist_ok=True); t.to_csv("reports/trades.csv",index=False); c.to_csv("reports/equity_curve.csv",index=False)
+        await update.message.reply_text(
+            f"📊 {symbol} Backtest\n{start} → {end}\n\n"
+            f"Initial: ${s['start_capital']:,.2f}\nFinal: ${s['final_equity']:,.2f}\nROI: {s['roi']:.2%}\n"
+            f"Trades: {s['trades']}\nWin rate: {s['win_rate']:.2%}\nProfit factor: {s['profit_factor']:.2f}\n"
+            f"Max DD: {s['max_drawdown']:.2%}\nSharpe: {s['sharpe']:.2f}\n"
+            f"Funding: REAL\nOI: {'REAL' if oi is not None else 'UNAVAILABLE'}"
         )
-
-    async def _submit():
-        client = await _make_client(f"login_{session_name}")
-        try:
-            return await client.sign_in(
-                phone_code=code,
-                phone_number=phone,
-                phone_code_hash=phone_code_hash,
-                public_key=public_key_pem,
-            )
-        finally:
-            await _disconnect_client(client)
-
-    try:
-        result = run_async(_submit())
-        auth_val = extract_field(result, ["auth", "auth_key", "key"])
-        if auth_val and Crypto is not None:
-            raw = str(auth_val)
-            try:
-                # auth واقعی داخل این رشته با کلید خصوصی‌مون RSA-OAEP رمزگذاری شده
-                auth_val = Crypto.decrypt_RSA_OAEP(private_key_pem, raw)
-            except Exception:
-                try:
-                    auth_val = Crypto.decode_auth(raw)
-                except Exception:
-                    pass
-        if auth_val:
-            return True, str(auth_val), "ورود موفق"
-        return True, None, f"موفق بود ولی auth پیدا نشد. فیلدهای واقعی:\n{dump_fields(result)}"
     except Exception as e:
-        return False, None, (
-            f"{type(e).__name__}: {e}\n\n"
-            f"phone_code_hash: {phone_code_hash!r}\n"
-            f"فیلدهای send_code: {dump_fields(send_code_result)}\n"
-            f"طول public_key: {len(public_key_pem)}"
-        )
+        logging.exception("backtest failed"); await update.message.reply_text(f"❌ Error: {e}")
 
-
-@bot.message_handler(commands=["login"])
-def login_start(message):
-    waiting_for_login_phone.add(message.chat.id)
-    bot.reply_to(
-        message,
-        "شماره اکانت رو با کد کشور بفرست (مثلاً 989123456789).\n"
-        "اگه خطا خوردی، /debugrubpy یا /debugsource رو بزن.",
-    )
-
-
-@bot.message_handler(func=lambda m: m.chat.id in waiting_for_login_phone, content_types=["text"])
-def login_process_phone(message):
-    chat_id = message.chat.id
-    waiting_for_login_phone.discard(chat_id)
-
-    phone = message.text.strip()
-    status_msg = bot.reply_to(message, "در حال ارسال درخواست کد تایید...")
-
-    ok, session_name, send_code_result, private_pem, public_pem, detail = start_login(phone)
-    if not ok:
-        bot.edit_message_text(f"ارسال کد ناموفق بود: {detail}", chat_id=status_msg.chat.id, message_id=status_msg.message_id)
-        return
-
-    pending_login_by_chat[chat_id] = {
-        "session_name": session_name,
-        "phone": phone,
-        "send_code_result": send_code_result,
-        "public_pem": public_pem,
-        "private_pem": private_pem,
-    }
-    bot.edit_message_text(
-        f"{detail}. حالا کدی که برای اکانت {phone} اومد رو بفرست.",
-        chat_id=status_msg.chat.id, message_id=status_msg.message_id,
-    )
-
-
-@bot.message_handler(func=lambda m: m.chat.id in pending_login_by_chat, content_types=["text"])
-def login_process_code(message):
-    chat_id = message.chat.id
-    pending = pending_login_by_chat.pop(chat_id, None)
-    if pending is None:
-        return
-
-    code = message.text.strip()
-    status_msg = bot.reply_to(message, "در حال بررسی کد...")
-
-    ok, auth, detail = submit_login_code(
-        pending["session_name"], pending["phone"], code,
-        pending["send_code_result"], pending["public_pem"], pending["private_pem"],
-    )
-    if not ok:
-        bot.edit_message_text(f"ورود ناموفق بود: {detail}", chat_id=status_msg.chat.id, message_id=status_msg.message_id)
-        return
-
-    if auth:
-        bot.edit_message_text(
-            f"{detail} ✅\n\nبرای /check این دو خط رو (با یه خط خالی از اکانت بعدی جدا) بفرست:\n\n"
-            f"{auth}\n{pending['private_pem']}",
-            chat_id=status_msg.chat.id, message_id=status_msg.message_id,
-        )
-    else:
-        bot.edit_message_text(detail, chat_id=status_msg.chat.id, message_id=status_msg.message_id)
-
-
-def parse_auth_entries(raw: str) -> list[tuple[str, str]]:
-    """
-    هر اکانت به‌صورت دو خط پشت‌سرهم می‌فرستی: auth بعد private_key.
-    private_key چندخطیه (فرمت PEM)، پس با یه خط خالی از اکانت بعدی جدا می‌شه.
-    """
-    raw = raw.strip()
-    blocks = re.split(r"\n\s*\n", raw)
-    entries = []
-    for block in blocks:
-        lines = [line for line in block.splitlines() if line.strip()]
-        if len(lines) < 2:
-            continue
-        auth = lines[0].strip()
-        private_key = "\n".join(lines[1:]).strip()
-        entries.append((auth, private_key))
-    return entries
-
-
-@bot.message_handler(commands=["start", "help"])
-def start(message):
-    bot.reply_to(
-        message,
-        "سلام 👋\n/check برای بررسی auth، /login برای ساخت auth جدید با شماره.\n"
-        "برای دیباگ: /debugrubpy یا /debugsource",
-    )
-
-
-@bot.message_handler(commands=["check"])
-def ask_auths(message):
-    waiting_for_auths.add(message.chat.id)
-    bot.reply_to(
-        message,
-        "باشه، حالا اکانت‌هات رو بفرست: هر اکانت دو خط (auth بعدش private_key)، "
-        "و بین اکانت‌های مختلف یه خط خالی بذار.",
-    )
-
-
-@bot.message_handler(func=lambda m: m.chat.id in waiting_for_auths, content_types=["text"])
-def process_auths(message):
-    waiting_for_auths.discard(message.chat.id)
-
-    entries = parse_auth_entries(message.text)
-    if not entries:
-        bot.reply_to(message, "چیزی دریافت نشد. دوباره /check رو بزن.")
-        return
-
-    status_msg = bot.reply_to(message, f"در حال بررسی {len(entries)} اکانت...")
-
-    healthy, healthy_entries, lines = 0, [], []
-    for i, (auth, private_key) in enumerate(entries, start=1):
-        ok, detail = check_single_auth(auth, private_key)
-        if ok:
-            healthy += 1
-            healthy_entries.append((auth, private_key))
-            lines.append(f"✅ اکانت {i}: سالم")
-        else:
-            lines.append(f"❌ اکانت {i}: مشکل دارد ({detail})")
-
-    summary = "نتیجه بررسی:\n\n" + "\n".join(lines) + f"\n\n📊 جمع‌بندی: {healthy} از {len(entries)} سالم."
-    bot.edit_message_text(summary, chat_id=status_msg.chat.id, message_id=status_msg.message_id)
-
-    if healthy_entries:
-        healthy_auths_by_chat[message.chat.id] = healthy_entries
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("بله، اد کن ✅", callback_data="join_yes"),
-            types.InlineKeyboardButton("نه", callback_data="join_no"),
-        )
-        bot.send_message(message.chat.id, f"می‌خوای {healthy} اکانت سالم رو عضو یه کانال کنم؟", reply_markup=markup)
-
-
-@bot.callback_query_handler(func=lambda c: c.data in ("join_yes", "join_no"))
-def handle_join_choice(call):
-    bot.answer_callback_query(call.id)
-    chat_id = call.message.chat.id
-
-    if call.data == "join_no":
-        healthy_auths_by_chat.pop(chat_id, None)
-        bot.edit_message_text("باشه، کاری انجام نشد.", chat_id=chat_id, message_id=call.message.message_id)
-        return
-
-    if chat_id not in healthy_auths_by_chat:
-        bot.send_message(chat_id, "لیست اکانت سالمی پیدا نشد. دوباره /check رو بزن.")
-        return
-
-    waiting_for_channel.add(chat_id)
-    bot.edit_message_text("آیدی یا لینک کانال روبیکا رو بفرست.", chat_id=chat_id, message_id=call.message.message_id)
-
-
-def join_channel_with_auth(auth: str, private_key: str, channel_id: str) -> tuple[bool, str]:
-    async def _join():
-        client = Client(name=f"temp_join_{abs(hash(auth))}", auth=auth.strip(), private_key=private_key)
-        client.import_key = make_import_key(private_key)
-        if callable(getattr(client, "connect", None)):
-            await client.connect()
-            client.import_key = make_import_key(private_key)
-        try:
-            join_fn = next(
-                (getattr(client, n) for n in dir(client) if "join" in n.lower() and callable(getattr(client, n))),
-                None,
-            )
-            if join_fn is None:
-                raise AttributeError("هیچ متد join پیدا نشد")
-            kwargs = build_kwargs(join_fn, {"channel": channel_id, "guid": channel_id, "link": channel_id})
-            await (join_fn(**kwargs) if kwargs else join_fn(channel_id))
-        finally:
-            await _disconnect_client(client)
-
+async def walkforward_cmd(update,context):
     try:
-        run_async(_join())
-        return True, "عضو شد"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-
-@bot.message_handler(func=lambda m: m.chat.id in waiting_for_channel, content_types=["text"])
-def process_channel_join(message):
-    chat_id = message.chat.id
-    waiting_for_channel.discard(chat_id)
-
-    channel_id = message.text.strip()
-    healthy_entries = healthy_auths_by_chat.pop(chat_id, [])
-    if not healthy_entries:
-        bot.reply_to(message, "لیست اکانت سالمی پیدا نشد. دوباره /check رو بزن.")
-        return
-
-    status_msg = bot.reply_to(message, f"در حال اد کردن {len(healthy_entries)} اکانت به کانال...")
-
-    joined, lines = 0, []
-    for i, (auth, private_key) in enumerate(healthy_entries, start=1):
-        ok, detail = join_channel_with_auth(auth, private_key, channel_id)
-        if ok:
-            joined += 1
-        lines.append(f"{'✅' if ok else '❌'} اکانت {i}: {detail}")
-
-    summary = "نتیجه اد کردن:\n\n" + "\n".join(lines) + f"\n\n📊 {joined} از {len(healthy_entries)} موفق."
-    bot.edit_message_text(summary, chat_id=status_msg.chat.id, message_id=status_msg.message_id)
-
-
-if __name__ == "__main__":
-    if BOT_TOKEN == "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        log.warning("BOT_TOKEN تنظیم نشده!")
-    log.info("ربات در حال اجراست...")
-    bot.infinity_polling()
+        a=context.args; symbol=a[0] if len(a)>0 else CFG.symbol
+        start=a[1] if len(a)>1 else "2025-01-01"; end=a[2] if len(a)>2 else "2026-08-01"
+        api=KuCoinFutures(CFG.base_url)
+        await update.message.reply_text("⏳ Running walk-forward: downloading data and optimizing each training fold...")
+        df=api.klines(symbol,start,end,"15m"); funding=api.funding_history(symbol,start,end)
+        try: oi=api.open_interest_history(symbol,start,end,"15min")
+        except RuntimeError: oi=None
+        s,folds,trades=walk_forward(df,funding,oi,CFG.capital,CFG.risk,CFG.fee,CFG.slippage)
+        Path("reports").mkdir(exist_ok=True); folds.to_csv("reports/walk_forward_folds.csv",index=False); trades.to_csv("reports/walk_forward_trades.csv",index=F
