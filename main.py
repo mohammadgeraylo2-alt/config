@@ -412,4 +412,24 @@ async def walkforward_cmd(update,context):
         try: oi=api.open_interest_history(symbol,start,end,"15min")
         except RuntimeError: oi=None
         s,folds,trades=walk_forward(df,funding,oi,CFG.capital,CFG.risk,CFG.fee,CFG.slippage)
-        Path("reports").mkdir(exist_ok=True); folds.to_csv("reports/walk_forward_folds.csv",index=False); trades.to_csv("reports/walk_forward_trades.csv",index=F
+        Path("reports").mkdir(exist_ok=True); folds.to_csv("reports/walk_forward_folds.csv",index=False); trades.to_csv("reports/walk_forward_trades.csv",index=False)
+        await update.message.reply_text(
+            f"🧪 Walk-Forward {symbol}\nFolds: {s['folds']}\n"
+            f"OOS compounded ROI: {s['oos_roi_compounded']:.2%}\n"
+            f"Median OOS ROI: {s['median_test_roi']:.2%}\n"
+            f"Median OOS PF: {s['median_test_pf']:.2f}\n"
+            f"Worst OOS DD: {s['worst_test_dd']:.2%}\n"
+            f"OOS trades: {s['total_test_trades']}\n"
+            f"Funding: REAL\nOI: {'REAL' if oi is not None else 'UNAVAILABLE'}"
+        )
+    except Exception as e:
+        logging.exception("walkforward failed"); await update.message.reply_text(f"❌ Error: {e}")
+
+def main():
+    if not CFG.token: raise SystemExit("TELEGRAM_BOT_TOKEN is required")
+    app=Application.builder().token(CFG.token).build()
+    for cmd,fn in [("start",start),("help",start),("status",status),("pause",pause),("resume",resume),("backtest",backtest),("walkforward",walkforward_cmd)]:
+        app.add_handler(CommandHandler(cmd,fn))
+    app.run_polling()
+
+if __name__=="__main__": main()
