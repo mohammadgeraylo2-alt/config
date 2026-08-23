@@ -427,7 +427,7 @@ async def walkforward_cmd(update,context):
 
 def main():
     if not CFG.token: raise SystemExit("TELEGRAM_BOT_TOKEN is required")
-    app=Application.builder().token(CFG.token).build()
+   app=Application.builder().token(CFG.token).connect_timeout(30).read_timeout(30).get_updates_read_timeout(30).build()
     for cmd,fn in [("start",start),("help",start),("status",status),("pause",pause),("resume",resume),("backtest",backtest),("walkforward",walkforward_cmd)]:
         app.add_handler(CommandHandler(cmd,fn))
     app.run_polling()
