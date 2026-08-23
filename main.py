@@ -1,5 +1,6 @@
 # core.py — merged: config + kucoin client + indicators + strategy + backtest + walk-forward
 import os
+from pathlib import Path
 import time
 import itertools
 from dataclasses import dataclass, asdict
