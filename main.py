@@ -1,186 +1,74 @@
-import os, json, time, uuid, base64, secrets, subprocess, threading, io, hmac, urllib.parse as U
-from pathlib import Path
-import bcrypt, qrcode
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response, JSONResponse
+"""مدیریت پروسه Xray: ساخت کانفیگ، ری‌استارت امن، و خواندن مصرف."""
+import json, os, subprocess, logging
 
-D = Path(os.environ.get("DATA_DIR", "/app/data")); D.mkdir(parents=True, exist_ok=True)
-DB, CORE, NGX = D / "db.json", D / "core.json", Path("/tmp/n.conf")
-PORT = os.environ.get("PORT", "8080")
-LOCK, PROC, SESS = threading.RLock(), {}, {}
-GB = 1024 ** 3
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+log = logging.getLogger("panel.xray")
+BIN = os.environ.get("XRAY_BIN", "xray")
+PRIVATE = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+           "100.64.0.0/10", "0.0.0.0/8", "::1/128", "fc00::/7", "fe80::/10"]
 
 
-def load():
-    if DB.exists():
-        return json.loads(DB.read_text())
-    pw = os.environ.get("ADMIN_PASS") or secrets.token_urlsafe(9)
-    print(f"[panel] first run -> user: admin  pass: {pw}", flush=True)
-    d = {"admin": "admin", "hash": bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode(),
-         "path": "/" + secrets.token_hex(8), "users": {}}
-    save(d); return d
+class Xray:
+    def __init__(self, directory, ws_path, port=10000, api_port=10085):
+        os.makedirs(directory, exist_ok=True)
+        self.cfg = os.path.join(directory, "config.json")
+        self.ws_path, self.port, self.api = ws_path, port, api_port
+        self.proc, self.current = None, None
 
-
-def save(d):
-    with LOCK:
-        if DB.exists():
-            (D / "db.bak.json").write_bytes(DB.read_bytes())  # پشتیبان خودکار قبل از هر ذخیره
-        tmp = D / "db.tmp"; tmp.write_text(json.dumps(d, ensure_ascii=False)); tmp.replace(DB)
-
-
-db = load()
-
-
-def alive(u):
-    return u["on"] and (not u["gb"] or u["used"] < u["gb"] * GB) and (not u["exp"] or u["exp"] > time.time())
-
-
-def write_core():
-    ids = [{"id": i, "email": i[:8]} for i, u in db["users"].items() if alive(u)]
-    core = {"log": {"loglevel": "warning"}, "stats": {}, "api": {"tag": "api", "services": ["StatsService"]},
+    def build(self, clients):
+        return {
+            "log": {"loglevel": "warning"}, "stats": {},
+            "api": {"tag": "api", "services": ["StatsService"]},
             "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}},
             "inbounds": [
-                {"tag": "in", "listen": "127.0.0.1", "port": 10000, "protocol": "vless",
-                 "settings": {"clients": ids, "decryption": "none"},
-                 "streamSettings": {"network": "ws", "wsSettings": {"path": db["path"]}}},
-                {"tag": "api", "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door",
-                 "settings": {"address": "127.0.0.1"}}],
-            "outbounds": [{"protocol": "freedom"}],
-            "routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}}
-    CORE.write_text(json.dumps(core)); return {c["id"] for c in ids}
+                {"tag": "api-in", "listen": "127.0.0.1", "port": self.api, "protocol": "dokodemo-door",
+                 "settings": {"address": "127.0.0.1"}},
+                {"tag": "vless-ws", "listen": "127.0.0.1", "port": self.port, "protocol": "vless",
+                 "settings": {"decryption": "none", "clients": [{"id": u, "email": e, "level": 0} for u, e in clients]},
+                 "streamSettings": {"network": "ws", "wsSettings": {"path": self.ws_path}}}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
+            # جلوگیری از دسترسی کاربران به شبکه داخلی (از جمله خود پنل)
+            "routing": {"domainStrategy": "IPIfNonMatch", "rules": [
+                {"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
+                {"type": "field", "ip": PRIVATE, "outboundTag": "block"}]}}
 
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
 
-def run_core():
-    if PROC.get("c"):
-        PROC["c"].terminate(); PROC["c"].wait()
-    PROC["ids"] = write_core()
-    PROC["c"] = subprocess.Popen(["/usr/local/bin/core", "run", "-c", str(CORE)])
+    def stop(self):
+        if self.running():
+            self.proc.terminate()
+            try: self.proc.wait(5)
+            except subprocess.TimeoutExpired: self.proc.kill()
+        self.proc = None
 
+    def apply(self, clients):
+        """clients: لیست (uuid, email). فقط وقتی مجموعه تغییر کرده یا پروسه افتاده ری‌استارت می‌کند."""
+        key = sorted(clients)
+        if key == self.current and (self.running() or not key): return
+        if not key:
+            self.stop(); self.current = key; return
+        tmp = self.cfg + ".new"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f: json.dump(self.build(clients), f)
+        t = subprocess.run([BIN, "run", "-test", "-c", tmp], capture_output=True, text=True, timeout=30)
+        if t.returncode:
+            log.error("xray config test failed: %s", (t.stdout + t.stderr)[-400:]); return
+        os.replace(tmp, self.cfg); self.stop()
+        self.proc = subprocess.Popen([BIN, "run", "-c", self.cfg]); self.current = key
+        log.warning("xray (re)started with %d clients", len(key))
 
-def watch():
-    while True:
-        time.sleep(30)
+    def drain(self):
+        """مصرف تجمیعی از آخرین بار را برمی‌گرداند و شمارنده را صفر می‌کند: {service_id: bytes}"""
+        if not self.running(): return {}
         try:
-            with LOCK:
-                out = subprocess.run(["/usr/local/bin/core", "api", "statsquery", "--server=127.0.0.1:10085", "-reset"],
-                                     capture_output=True, text=True, timeout=10).stdout
-                for s in json.loads(out or "{}").get("stat", []):
-                    if not s["name"].startswith("user>>>"): continue
-                    mail = s["name"].split(">>>")[1]
-                    for i, u in db["users"].items():
-                        if i.startswith(mail):
-                            u["used"] += int(s.get("value", 0))
-                save(db)
-                if {i for i, u in db["users"].items() if alive(u)} != PROC.get("ids") or PROC["c"].poll() is not None:
-                    run_core()
+            r = subprocess.run([BIN, "api", "statsquery", "-s", f"127.0.0.1:{self.api}", "-pattern", "user>>>", "-reset"],
+                               capture_output=True, text=True, timeout=10)
+            data = json.loads(r.stdout or "{}")
         except Exception as e:
-            print("[watch]", e, flush=True)
-
-
-def need(r: Request):
-    t = r.cookies.get("t")
-    if not t or SESS.get(t, 0) < time.time():
-        raise HTTPException(401)
-
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return (Path(__file__).parent / "panel.html").read_text(encoding="utf-8")
-
-
-@app.post("/api/in")
-async def login(r: Request):
-    b = await r.json()
-    if b.get("u") == db["admin"] and bcrypt.checkpw(str(b.get("p", "")).encode(), db["hash"].encode()):
-        t = secrets.token_urlsafe(24); SESS[t] = time.time() + 86400 * 7
-        res = JSONResponse({"ok": 1}); res.set_cookie("t", t, httponly=True, samesite="strict", secure=True, max_age=604800)
-        return res
-    time.sleep(1); raise HTTPException(403, "نام کاربری یا رمز اشتباه است")
-
-
-@app.get("/api/users")
-def users(r: Request):
-    need(r)
-    return {"users": [{"id": i, **u, "alive": alive(u)} for i, u in db["users"].items()]}
-
-
-@app.post("/api/users")
-async def add(r: Request):
-    need(r); b = await r.json()
-    with LOCK:
-        i = str(uuid.uuid4())
-        db["users"][i] = {"name": str(b.get("name") or "کاربر")[:40], "gb": float(b.get("gb") or 0), "used": 0,
-                          "exp": time.time() + float(b["days"]) * 86400 if b.get("days") else 0,
-                          "on": True, "sub": secrets.token_urlsafe(10)}
-        save(db); run_core()
-    return {"id": i}
-
-
-@app.post("/api/users/{i}/{act}")
-def act(i: str, act: str, r: Request):
-    need(r)
-    with LOCK:
-        u = db["users"].get(i) or (_ for _ in ()).throw(HTTPException(404))
-        if act == "del": del db["users"][i]
-        elif act == "toggle": u["on"] = not u["on"]
-        elif act == "reset": u["used"] = 0
-        else: raise HTTPException(400)
-        save(db); run_core()
-    return {"ok": 1}
-
-
-def link(u, host):
-    p = U.quote(db["path"], safe="")
-    i = next(k for k, v in db["users"].items() if v is u)
-    return f"vless://{i}@{host}:443?encryption=none&security=tls&type=ws&host={host}&sni={host}&path={p}#{U.quote(u['name'])}"
-
-
-@app.get("/s/{tok}")
-def sub(tok: str, r: Request):
-    u = next((v for v in db["users"].values() if hmac.compare_digest(v["sub"], tok)), None)
-    if not u or not alive(u): raise HTTPException(404)
-    left = max(u["gb"] * GB - u["used"], 0) if u["gb"] else 0
-    h = {"subscription-userinfo": f"upload=0; download={int(u['used'])}; total={int(u['gb'] * GB)}; expire={int(u['exp'])}",
-         "profile-title": u["name"]}
-    return PlainTextResponse(base64.b64encode(link(u, r.headers.get("host", "")).encode()).decode(), headers=h)
-
-
-@app.get("/api/qr/{tok}")
-def qr(tok: str, r: Request):
-    need(r); b = io.BytesIO()
-    qrcode.make(f"https://{r.headers.get('host')}/s/{tok}").save(b, "PNG")
-    return Response(b.getvalue(), media_type="image/png")
-
-
-@app.get("/api/backup")
-def backup(r: Request):
-    need(r)
-    return Response(DB.read_bytes(), media_type="application/json",
-                    headers={"content-disposition": f"attachment; filename=backup-{int(time.time())}.json"})
-
-
-@app.post("/api/restore")
-async def restore(r: Request, f: UploadFile = File(...)):
-    global db
-    need(r); d = json.loads(await f.read())
-    if not {"admin", "hash", "path", "users"} <= d.keys(): raise HTTPException(400, "فایل پشتیبان معتبر نیست")
-    with LOCK: db = d; save(db); run_core()
-    return {"ok": 1}
-
-
-def boot():
-    NGX.write_text(f"""pid /tmp/n.pid; error_log /dev/stderr warn; events {{}}
-http {{ access_log off; client_body_temp_path /tmp/nb; proxy_temp_path /tmp/np; client_max_body_size 20m;
- server {{ listen {PORT};
-  location = {db['path']} {{ proxy_pass http://127.0.0.1:10000; proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade;
-   proxy_set_header Connection "upgrade"; proxy_set_header Host $host; proxy_read_timeout 3600s; }}
-  location / {{ proxy_pass http://127.0.0.1:8000; proxy_set_header Host $host; }} }} }}""")
-    run_core()
-    subprocess.Popen(["nginx", "-c", str(NGX), "-g", "daemon off;"])
-    threading.Thread(target=watch, daemon=True).start()
-    import uvicorn; uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
-
-
-if __name__ == "__main__":
-    boot()
+            log.warning("stats query failed: %s", e); return {}
+        out = {}
+        for it in data.get("stat", []):
+            p = it.get("name", "").split(">>>")
+            if len(p) == 4 and p[1].startswith("s") and p[1][1:].isdigit():
+                out[int(p[1][1:])] = out.get(int(p[1][1:]), 0) + int(it.get("value") or 0)
+        return out
