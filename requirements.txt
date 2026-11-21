@@ -1,0 +1,8 @@
+aiogram>=3.7,<4
+aiohttp-socks>=0.9
+google-genai>=1.0
+edge-tts>=6.1.9
+Pillow>=10.0
+arabic-reshaper>=3.0
+python-bidi>=0.4.2
+python-dotenv>=1.0
